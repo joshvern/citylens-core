@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+.venv/
+venv/
+
+# Artifacts / data
+weights/
+data/
+*.pth
+*.pt
+*.las
+*.laz
+*.tif
+*.tiff
+*.zip

@@ -48,6 +48,8 @@ def run_sam2_auto_mask(
         ) from e
 
     target_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(target_device, str) and target_device.startswith("cuda") and not torch.cuda.is_available():
+        target_device = "cpu"
 
     # PyTorch >=2.6 defaults weights_only=True which can break some SAM2 checkpoints.
     orig_torch_load = torch.load

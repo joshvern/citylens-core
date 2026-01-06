@@ -12,15 +12,35 @@ def test_sam2_optional(tmp_path: Path) -> None:
 
     from citylens_core import CitylensRequest, run_citylens
 
+    # Provide real input images so we can validate failure behavior without
+    # producing placeholder outputs.
+    try:
+        from PIL import Image
+
+        ortho = tmp_path / "ortho.png"
+        base = tmp_path / "base.png"
+        Image.new("RGB", (64, 64), color=(128, 128, 128)).save(ortho)
+        Image.new("RGB", (64, 64), color=(127, 127, 127)).save(base)
+    except Exception as e:
+        pytest.skip(f"PIL unavailable: {e}")
+
     # Intentionally point at default asset locations that may not exist.
-    req = CitylensRequest(address="test", segmentation_backend="sam2")
+    req = CitylensRequest(
+        address="test",
+        segmentation_backend="sam2",
+        orthophoto_path=ortho,
+        baseline_path=base,
+        outputs=["previews", "change", "mesh"],
+    )
     artifacts = run_citylens(req, tmp_path)
 
-    assert artifacts["preview"].exists()
-    assert artifacts["change"].exists()
-    assert artifacts["mesh"].exists()
+    # Missing weights should fail and only produce run_summary.json
+    assert set(artifacts.keys()) == {"summary"}
     assert artifacts["summary"].exists()
+    assert not (tmp_path / "preview.png").exists()
+    assert not (tmp_path / "change.geojson").exists()
+    assert not (tmp_path / "mesh.ply").exists()
 
     payload = json.loads(artifacts["summary"].read_text())
-    # Should not crash even if weights missing; should warn instead.
-    assert isinstance(payload.get("warnings"), list)
+    assert payload.get("ok") is False
+    assert payload.get("error_code") in ("missing_dependency", "pipeline_error")

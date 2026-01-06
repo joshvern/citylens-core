@@ -173,7 +173,14 @@ def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -
         return _fail(code="pipeline_error", message=f"{type(e).__name__}: {e}", missing_paths=None)
 
     # Success path: ensure required artifacts exist and record metadata.
-    required = ["preview", "change", "mesh"]
+    # Honor outputs gating: only require artifacts that were requested.
+    required: list[str] = []
+    if want_preview:
+        required.append("preview")
+    if want_change:
+        required.append("change")
+    if want_mesh:
+        required.append("mesh")
     missing_required: list[str] = []
     for key in required:
         p = standard_paths[key]
@@ -201,4 +208,12 @@ def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -
     write_run_summary(summary, standard_paths["summary"], extra={"duration_s": duration_s})
 
     _emit_progress(progress_cb, 100, "done")
-    return standard_paths
+
+    # Return only paths that exist to avoid callers trying to consume
+    # intentionally-skipped artifacts.
+    out: dict[str, Path] = {"summary": standard_paths["summary"]}
+    for k in ("preview", "change", "mesh"):
+        p = standard_paths[k]
+        if p.exists():
+            out[k] = p
+    return out

@@ -5,15 +5,15 @@ from typing import Optional
 
 import numpy as np
 
-from .assets import Sam2AssetsMissingError, ensure_sam2_assets
+from .assets import Sam2AssetsMissingError, assets_root, ensure_sam2_assets
 
 
 class Sam2UnavailableError(RuntimeError):
     """Raised when SAM2 is not usable (missing package or missing assets)."""
 
 
-def _resolve_repo_relative(p: Path) -> Path:
-    root = Path(__file__).resolve().parents[3]
+def _resolve_checkpoint_path(p: Path) -> Path:
+    root = assets_root()
     return p if p.is_absolute() else (root / p)
 
 
@@ -35,8 +35,11 @@ def run_sam2_auto_mask(
     except Sam2AssetsMissingError as e:
         raise Sam2UnavailableError(str(e)) from e
 
-    cfg = _resolve_repo_relative(cfg_path)
-    ckpt = _resolve_repo_relative(ckpt_path)
+    # IMPORTANT: SAM2's Hydra config loader expects the config as a reference within the
+    # installed `sam2` package (e.g. "configs/sam2.1/sam2.1_hiera_s.yaml"), not an absolute
+    # filesystem path. Only the checkpoint must be a filesystem path.
+    cfg = str(cfg_path).strip()
+    ckpt = str(_resolve_checkpoint_path(ckpt_path).resolve())
 
     try:
         import torch
@@ -62,7 +65,7 @@ def run_sam2_auto_mask(
     torch.load = _torch_load
     try:
         # SAM2 expects a config path/name; we use the YAML path.
-        model = build_sam2(str(cfg), str(ckpt), device=target_device)
+        model = build_sam2(cfg, ckpt, device=target_device)
     finally:
         torch.load = orig_torch_load
     try:

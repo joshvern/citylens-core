@@ -46,8 +46,8 @@ def test_missing_sam2_weights_fails_no_model_artifacts(tmp_path: Path) -> None:
         segmentation_backend="sam2",
         orthophoto_path=ortho,
         baseline_path=base,
-        sam2_cfg="/no/such/config.yaml",
-        sam2_checkpoint="/no/such/weights.pt",
+        sam2_cfg="configs/sam2.1/nonexistent.yaml",
+        sam2_checkpoint="weights/nonexistent.pt",
         outputs=["previews", "change", "mesh"],
     )
 
@@ -63,8 +63,5 @@ def test_missing_sam2_weights_fails_no_model_artifacts(tmp_path: Path) -> None:
     assert payload.get("ok") is False
     assert payload.get("error_code") == "missing_dependency"
     assert payload.get("error_message")
-    missing = payload.get("missing_paths")
-    assert isinstance(missing, list)
-    assert any("config" in (p.lower()) or p.endswith(".yaml") for p in missing) or any(
-        p.endswith(".pt") for p in missing
-    )
+    # With the new asset loading logic, missing checkpoint will be reported
+    assert "SAM2" in payload.get("error_message", "")

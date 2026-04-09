@@ -7,7 +7,7 @@ name = "citylens-core"
 version = "0.2.0"
 description = "Citylens reusable pipeline core (local-workdir artifacts, pluggable segmentation backends)."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Citylens" }]
 dependencies = [
@@ -22,8 +22,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "ruff>=0.3"]
-mesh = ["open3d>=0.18"]
-sam2 = ["sam-2 @ git+https://github.com/facebookresearch/sam2.git"]
+lidar = ["laspy>=2.5"]
+sam2 = ["sam-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -37,4 +37,4 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"

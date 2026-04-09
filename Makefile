@@ -1,6 +1,6 @@
 .PHONY: help venv install install-sam2 test sam2-assets sam2-assets-all
 
-PYTHON ?= python3.10
+PYTHON ?= python3.11
 VENV ?= .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
@@ -14,8 +14,8 @@ help:
 	@echo "make sam2-assets-all  # download SAM2.1 small + large"
 
 $(VENV)/bin/activate:
-	@$(PYTHON) -c "import sys; assert sys.version_info >= (3,10), sys.version" \
-	  || (echo "Python 3.10+ required. Set PYTHON=python3.10" && exit 2)
+	@$(PYTHON) -c "import sys; assert sys.version_info >= (3,11), sys.version" \
+	  || (echo "Python 3.11+ required. Set PYTHON=python3.11 or PYTHON=/home/josh/.local/bin/python3.11" && exit 2)
 	$(PYTHON) -m venv $(VENV)
 	$(PY) -m pip install --upgrade pip setuptools wheel
 

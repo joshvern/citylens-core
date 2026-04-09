@@ -12,8 +12,11 @@ def _write_dummy_rgb(path: Path) -> None:
     Image.new("RGB", (64, 64), color=(128, 128, 128)).save(path)
 
 
-def test_missing_inputs_fails_and_writes_only_summary(tmp_path: Path) -> None:
+def test_missing_inputs_fails_and_writes_only_summary(tmp_path: Path, monkeypatch) -> None:
     from citylens_core import CitylensRequest, run_citylens
+    import citylens_core.sam.assets as sam_assets
+
+    monkeypatch.setattr(sam_assets, "ensure_sam2_assets", lambda *args, **kwargs: None)
 
     req = CitylensRequest(address="test", segmentation_backend="sam2", outputs=["previews", "change", "mesh"])
     artifacts = run_citylens(req, tmp_path)
@@ -63,5 +66,4 @@ def test_missing_sam2_weights_fails_no_model_artifacts(tmp_path: Path) -> None:
     assert payload.get("ok") is False
     assert payload.get("error_code") == "missing_dependency"
     assert payload.get("error_message")
-    # With the new asset loading logic, missing checkpoint will be reported
     assert "SAM2" in payload.get("error_message", "")

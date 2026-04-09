@@ -17,19 +17,9 @@ def stage_segment(
     summary: PipelineSummary,
 ) -> dict[str, Any]:
     ortho_path = Path(ctx.get("orthophoto_path", work_dir / "orthophoto.png"))
-    baseline_path = Path(ctx.get("baseline_path", work_dir / "baseline.png"))
 
     outputs = {str(o).strip().lower() for o in (request.outputs or []) if str(o).strip()}
     want_change = "change" in outputs
-
-    backend = request.segmentation_backend
-    if backend in ("unet", "smp"):
-        raise NotImplementedError(
-            "segmentation_backend must be 'sam2' for real model outputs; "
-            f"got '{backend}'."
-        )
-    if backend != "sam2":
-        raise ValueError(f"Unknown segmentation_backend: {backend}")
 
     img = Image.open(ortho_path).convert("RGB")
     image_rgb = np.array(img)
@@ -49,6 +39,7 @@ def stage_segment(
     baseline_mask = None
     baseline_mask_path = None
     if want_change:
+        baseline_path = Path(ctx.get("baseline_path", work_dir / "baseline.png"))
         baseline_img = Image.open(baseline_path).convert("RGB")
         baseline_rgb = np.array(baseline_img)
         try:

@@ -2,9 +2,25 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+def _default_qa() -> dict[str, Any]:
+    return {
+        "reference_case_id": None,
+        "baseline_footprints_used": False,
+        "lidar_used": False,
+        "mask_iou": None,
+        "change_polygon_f1": None,
+        "mesh_footprint_iou": None,
+        "parity_status": "not_evaluated",
+    }
+
+
+def _default_performance() -> dict[str, Any]:
+    return {"total_runtime_seconds": None, "stage_timings_seconds": {}}
 
 
 class CitylensRequest(BaseModel):
@@ -12,11 +28,13 @@ class CitylensRequest(BaseModel):
     aoi_radius_m: int = 250
     imagery_year: int = 2024
     baseline_year: int = 2017
-    segmentation_backend: Literal["unet", "smp", "sam2"] = "sam2"
+    segmentation_backend: Literal["sam2"] = "sam2"
     sam2_cfg: Optional[str] = "configs/sam2.1/sam2.1_hiera_s.yaml"
     sam2_checkpoint: Optional[str] = "weights/sam2.1_hiera_small.pt"
     orthophoto_path: Optional[Path] = None
+    orthophoto_url: Optional[str] = None
     baseline_path: Optional[Path] = None
+    baseline_url: Optional[str] = None
     outputs: list[str] = Field(default_factory=lambda: ["previews", "change", "mesh"])
     notes: Optional[str] = None
 
@@ -41,6 +59,9 @@ class PipelineSummary(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     stage_status: dict[str, str] = Field(default_factory=dict)
+    qa: dict[str, Any] = Field(default_factory=_default_qa)
+    performance: dict[str, Any] = Field(default_factory=_default_performance)
+    details: dict[str, Any] = Field(default_factory=dict)
 
     def warn(self, msg: str) -> None:
         self.warnings.append(str(msg))

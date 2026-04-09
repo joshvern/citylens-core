@@ -4,14 +4,15 @@ from pathlib import Path
 from typing import Any
 
 from ..models import CitylensRequest, PipelineSummary
+from ..io.lidar import build_height_map_from_lidar
 
 
-def _write_mask_mesh_ply(mask, out_path: Path, *, max_dim: int = 256) -> None:
+def _write_height_mesh_ply(height_map, out_path: Path, *, max_dim: int = 256) -> None:
     import numpy as np
 
-    m = np.asarray(mask).astype(np.uint8)
+    m = np.asarray(height_map).astype(np.float32)
     if m.ndim != 2:
-        raise ValueError("mask must be a 2D array")
+        raise ValueError("height_map must be a 2D array")
 
     h, w = m.shape
     step = max(1, int(max(h, w) // max_dim))
@@ -62,10 +63,20 @@ def stage_reconstruct(
 ) -> dict[str, Any]:
     out_path = work_dir / "mesh.ply"
 
-    mask = ctx.get("mask")
+    mask = ctx.get("refined_mask", ctx.get("mask"))
     if mask is None:
         raise RuntimeError("reconstruct stage requires a segmentation mask")
 
-    _write_mask_mesh_ply(mask, out_path)
+    height_map, footprint_mask, source = build_height_map_from_lidar(
+        mask,
+        work_dir / "lidar.las",
+        ctx.get("orthophoto_transform"),
+    )
+    _write_height_mesh_ply(height_map, out_path)
 
-    return {**ctx, "mesh_path": out_path}
+    return {
+        **ctx,
+        "mesh_path": out_path,
+        "mesh_footprint_mask": footprint_mask.astype("uint8"),
+        "mesh_height_source": source,
+    }

@@ -57,3 +57,5 @@ the same `/home/josh/citylens` parent directory.
 
 SAM2 assets are downloaded on demand and are **not committed**.
 Use `make sam2-assets` to download the default small model assets.
+For release deployments, set `CITYLENS_ASSETS_ROOT` to a stable runtime path instead of relying on the current working directory.
+These SAM2 assets are required for worker/precompute generation, but they are **not** required to serve baked demo bundles from `citylens-engine/deploy/demo_artifacts`.

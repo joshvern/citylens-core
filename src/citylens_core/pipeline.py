@@ -157,6 +157,15 @@ def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -
         summary.qa["baseline_footprints_used"] = bool(ctx.get("baseline_footprints_mask") is not None)
         summary.qa["lidar_used"] = ctx.get("mesh_height_source") == "lidar"
 
+        # Attest to the real input bytes used by this run. These let a reader
+        # of run_summary.json answer "did this run actually use real imagery?"
+        # without pulling Firestore logs.
+        summary.qa["sam2_used"] = bool(req.segmentation_backend == "sam2")
+        for key in ("orthophoto_sha256", "baseline_sha256", "lidar_sha256"):
+            value = ctx.get(key)
+            if isinstance(value, str) and value:
+                summary.qa[key] = value
+
         if ref_mask is not None and baseline_mask is not None:
             try:
                 summary.qa["mask_iou"] = mask_iou(ref_mask, baseline_mask)

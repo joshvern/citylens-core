@@ -20,6 +20,9 @@ def test_run_summary_includes_qa_and_performance_fields(tmp_path: Path, monkeypa
             "orthophoto_path": Path(wd) / "orthophoto.png",
             "orthophoto_transform": None,
             "orthophoto_crs": None,
+            "orthophoto_sha256": "deadbeef" * 8,
+            "baseline_sha256": "cafebabe" * 8,
+            "lidar_sha256": "feedface" * 8,
         }
 
     def _stage_segment(req, wd, ctx, summary):
@@ -92,3 +95,9 @@ def test_run_summary_includes_qa_and_performance_fields(tmp_path: Path, monkeypa
     assert isinstance(payload["performance"]["total_runtime_seconds"], float)
     assert isinstance(payload["performance"]["stage_timings_seconds"], dict)
     assert "resolve" in payload["performance"]["stage_timings_seconds"]
+
+    # Input attestation: these fields prove the run consumed real bytes.
+    assert payload["qa"]["sam2_used"] is True
+    assert payload["qa"]["orthophoto_sha256"] == "deadbeef" * 8
+    assert payload["qa"]["baseline_sha256"] == "cafebabe" * 8
+    assert payload["qa"]["lidar_sha256"] == "feedface" * 8

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,18 @@ def _download_url(url: str, dest_path: Path) -> None:
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with Path(path).open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                if chunk:
+                    h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def _raster_metadata(path: Path) -> dict[str, Any]:
@@ -82,7 +95,14 @@ def stage_fetch(
         "orthophoto_path": ortho_path,
         "orthophoto_crs": ortho_meta["crs"],
         "orthophoto_transform": ortho_meta["transform"],
+        "orthophoto_sha256": _sha256_file(ortho_path),
     }
+
+    # If the worker materialized lidar.las into the work_dir, record its hash
+    # so run_summary.json can attest to the exact input bytes used.
+    lidar_candidate = work_dir / "lidar.las"
+    if lidar_candidate.exists():
+        out["lidar_sha256"] = _sha256_file(lidar_candidate)
 
     want_change = "change" in {str(o).strip().lower() for o in (request.outputs or []) if str(o).strip()}
     if want_change:
@@ -98,6 +118,7 @@ def stage_fetch(
                 "baseline_path": baseline_path,
                 "baseline_crs": baseline_meta["crs"],
                 "baseline_transform": baseline_meta["transform"],
+                "baseline_sha256": _sha256_file(baseline_path),
             }
         )
 

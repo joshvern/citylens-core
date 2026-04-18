@@ -64,12 +64,25 @@ def test_stage_fetch_downloads_url_inputs_into_work_dir(tmp_path: Path, monkeypa
     )
     summary = PipelineSummary(request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc))
 
+    # Drop a fake lidar.las into the work_dir to exercise the lidar-hash path.
+    (tmp_path / "lidar.las").write_bytes(b"lidar-bytes")
+
     ctx = stage_fetch(req, tmp_path, {}, summary)
 
     assert ctx["orthophoto_path"] == tmp_path / "orthophoto.png"
     assert ctx["baseline_path"] == tmp_path / "baseline.png"
     assert (tmp_path / "orthophoto.png").read_bytes() == payloads["https://example.test/ortho.png"]
     assert (tmp_path / "baseline.png").read_bytes() == payloads["https://example.test/base.png"]
+
+    import hashlib
+
+    assert ctx["orthophoto_sha256"] == hashlib.sha256(
+        payloads["https://example.test/ortho.png"]
+    ).hexdigest()
+    assert ctx["baseline_sha256"] == hashlib.sha256(
+        payloads["https://example.test/base.png"]
+    ).hexdigest()
+    assert ctx["lidar_sha256"] == hashlib.sha256(b"lidar-bytes").hexdigest()
 
 
 def test_change_stage_emits_georeferenced_geojson_when_metadata_exists(tmp_path: Path) -> None:

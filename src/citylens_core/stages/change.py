@@ -1,56 +1,125 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from ..models import CitylensRequest, PipelineSummary
 
 
-def _bbox_polygon(mask: Any) -> list[list[float]] | None:
+def _min_component_area_px() -> int:
+    """Connected components below this pixel area are dropped as noise.
+
+    Tunable via CITYLENS_CHANGE_MIN_AREA_PX. Default 8 — kills single-pixel
+    artifacts from morphology/thresholding without swallowing small buildings
+    at 1024x1024 resolution (a 5x5 building is still 25 px).
+    """
+    raw = os.getenv("CITYLENS_CHANGE_MIN_AREA_PX", "").strip()
     try:
-        import numpy as np
-
-        m = np.asarray(mask).astype(bool)
-        if m.size == 0 or not m.any():
-            return None
-        ys, xs = np.where(m)
-        y0, y1 = int(ys.min()), int(ys.max())
-        x0, x1 = int(xs.min()), int(xs.max())
-        # GeoJSON ring in (x, y) pixel coordinates
-        return [[float(x0), float(y0)], [float(x1), float(y0)], [float(x1), float(y1)], [float(x0), float(y1)], [float(x0), float(y0)]]
-    except Exception:
-        return None
+        value = int(raw) if raw else 8
+    except ValueError:
+        return 8
+    return max(0, value)
 
 
-def _ring_from_bbox(
-    x0: int,
-    y0: int,
-    x1: int,
-    y1: int,
+def _affine_identity():
+    from rasterio.transform import Affine
+
+    return Affine.identity()
+
+
+def _polygonize_mask(
+    mask: Any,
     *,
-    transform: Any | None = None,
-) -> list[list[float]]:
-    if transform is None:
-        return [
-            [float(x0), float(y0)],
-            [float(x1), float(y0)],
-            [float(x1), float(y1)],
-            [float(x0), float(y1)],
-            [float(x0), float(y0)],
-        ]
+    transform: Any | None,
+    min_area_px: int | None = None,
+) -> list[list[list[list[float]]]]:
+    """Trace a boolean mask into one ring-list per connected component.
 
-    tl = transform * (float(x0), float(y0))
-    tr = transform * (float(x1 + 1), float(y0))
-    br = transform * (float(x1 + 1), float(y1 + 1))
-    bl = transform * (float(x0), float(y1 + 1))
-    return [
-        [float(tl[0]), float(tl[1])],
-        [float(tr[0]), float(tr[1])],
-        [float(br[0]), float(br[1])],
-        [float(bl[0]), float(bl[1])],
-        [float(tl[0]), float(tl[1])],
-    ]
+    Returns a list of Polygon `coordinates` values (each is a list of rings).
+    The outer ring comes first, followed by interior holes (if any).
+    Coordinates are in (x, y) — either pixel space (if transform is None)
+    or projected world units (if transform is provided).
+    """
+    import numpy as np
+    from rasterio.features import shapes
+
+    m = np.asarray(mask).astype(bool)
+    if m.size == 0 or not m.any():
+        return []
+
+    if min_area_px is None:
+        min_area_px = _min_component_area_px()
+
+    # `shapes` needs a transform; if none given, use identity so we stay in
+    # pixel coordinates.
+    tr = transform if transform is not None else _affine_identity()
+
+    polygons: list[list[list[list[float]]]] = []
+    m_uint8 = m.astype("uint8")
+    for geom, value in shapes(m_uint8, mask=m, transform=tr):
+        if int(value) != 1:
+            continue
+        if geom.get("type") != "Polygon":
+            continue
+        coordinates = geom.get("coordinates") or []
+        if not coordinates:
+            continue
+
+        # Filter tiny specks by computing the polygon's pixel area.
+        # In pixel space this is trivial; in world space we compute the ring
+        # area analytically (shoelace) and bail if it's below the threshold
+        # scaled by pixel size.
+        outer = coordinates[0]
+        try:
+            area_world = abs(
+                sum(
+                    (outer[i][0] + outer[i + 1][0])
+                    * (outer[i + 1][1] - outer[i][1])
+                    for i in range(len(outer) - 1)
+                )
+                / 2.0
+            )
+        except Exception:
+            area_world = 0.0
+
+        if transform is None:
+            if area_world < float(min_area_px):
+                continue
+        else:
+            # Transform.a is x-pixel size, transform.e is y-pixel size (usually negative).
+            try:
+                px_area = abs(float(transform.a) * float(transform.e))
+            except Exception:
+                px_area = 1.0
+            min_world_area = max(px_area, 1e-9) * float(min_area_px)
+            if area_world < min_world_area:
+                continue
+
+        polygons.append([list(ring) for ring in coordinates])
+
+    return polygons
+
+
+def _build_feature(
+    *,
+    kind: str,
+    coordinates: list[list[list[float]]],
+    imagery_year: int,
+    baseline_year: int,
+    crs_value: str,
+) -> dict[str, Any]:
+    return {
+        "type": "Feature",
+        "properties": {
+            "kind": kind,
+            "imagery_year": imagery_year,
+            "baseline_year": baseline_year,
+            "crs": crs_value,
+        },
+        "geometry": {"type": "Polygon", "coordinates": coordinates},
+    }
 
 
 def stage_change(
@@ -86,23 +155,17 @@ def stage_change(
 
     features: list[dict[str, Any]] = []
     for kind, m in ("added", added), ("removed", removed):
-        bbox = _bbox_polygon(m)
-        if bbox is None:
-            continue
-        x0, y0 = int(bbox[0][0]), int(bbox[0][1])
-        x1, y1 = int(bbox[2][0]), int(bbox[2][1])
-        features.append(
-            {
-                "type": "Feature",
-                "properties": {
-                    "kind": kind,
-                    "imagery_year": request.imagery_year,
-                    "baseline_year": request.baseline_year,
-                    "crs": crs_value,
-                },
-                "geometry": {"type": "Polygon", "coordinates": [_ring_from_bbox(x0, y0, x1, y1, transform=transform)]},
-            }
-        )
+        polygons = _polygonize_mask(m, transform=transform)
+        for coordinates in polygons:
+            features.append(
+                _build_feature(
+                    kind=kind,
+                    coordinates=coordinates,
+                    imagery_year=request.imagery_year,
+                    baseline_year=request.baseline_year,
+                    crs_value=crs_value,
+                )
+            )
 
     feature_collection = {"type": "FeatureCollection", "features": features}
     out_path.write_text(json.dumps(feature_collection, indent=2))

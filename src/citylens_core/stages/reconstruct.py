@@ -71,6 +71,7 @@ def stage_reconstruct(
         mask,
         work_dir / "lidar.las",
         ctx.get("orthophoto_transform"),
+        dst_crs=ctx.get("orthophoto_crs"),
     )
     _write_height_mesh_ply(height_map, out_path)
 

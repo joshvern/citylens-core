@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -7,13 +8,108 @@ import numpy as np
 
 __all__ = ["build_height_map_from_lidar"]
 
+_logger = logging.getLogger(__name__)
+
+
+def _parse_las_crs(las: Any) -> Any | None:
+    """Best-effort CRS extraction from a laspy `LasData`.
+
+    laspy exposes CRS via header.parse_crs() on newer versions; fall back to
+    VLR scanning for older file formats. Returns a pyproj CRS or None.
+    """
+    try:
+        from pyproj import CRS
+    except Exception:
+        return None
+
+    header = getattr(las, "header", None)
+    if header is None:
+        return None
+
+    # Newer laspy: header.parse_crs() returns a pyproj CRS or None.
+    parse_crs = getattr(header, "parse_crs", None)
+    if callable(parse_crs):
+        try:
+            crs = parse_crs()
+            if crs is not None:
+                return CRS.from_user_input(crs)
+        except Exception:
+            pass
+
+    # Fallback: look for WKT/GeoKey VLRs.
+    vlrs = getattr(header, "vlrs", None) or []
+    for vlr in vlrs:
+        record = getattr(vlr, "record_id", None)
+        wkt = getattr(vlr, "string", None) or getattr(vlr, "parsed_record", None)
+        if record in (2111, 2112) and isinstance(wkt, str) and wkt.strip():
+            try:
+                return CRS.from_wkt(wkt)
+            except Exception:
+                continue
+
+    return None
+
+
+def _maybe_reproject(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    *,
+    src_crs: Any | None,
+    dst_crs: Any | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reproject (xs, ys) from src_crs to dst_crs if both are known & differ.
+
+    NYS NYC TopoBathymetric LiDAR tiles are delivered in NAD83 / NY Long
+    Island ftUS (EPSG:6539), but the worker fetches orthos in EPSG:3857.
+    Without this step, applying the ortho's inverse-affine to ft-based LiDAR
+    coords lands every point outside bounds and silently falls back to
+    mask-heights (producing a flat mesh).
+    """
+    if src_crs is None or dst_crs is None:
+        return xs, ys
+
+    try:
+        from pyproj import CRS, Transformer
+    except Exception:
+        return xs, ys
+
+    try:
+        src = CRS.from_user_input(src_crs)
+        dst = CRS.from_user_input(dst_crs)
+    except Exception:
+        return xs, ys
+
+    if src == dst:
+        return xs, ys
+
+    try:
+        transformer = Transformer.from_crs(src, dst, always_xy=True)
+        xs2, ys2 = transformer.transform(xs, ys)
+        return np.asarray(xs2, dtype=np.float64), np.asarray(ys2, dtype=np.float64)
+    except Exception as e:
+        _logger.warning(
+            "lidar_reprojection_failed",
+            extra={"src_crs": str(src_crs), "dst_crs": str(dst_crs), "error": f"{type(e).__name__}: {e}"},
+        )
+        return xs, ys
+
 
 def build_height_map_from_lidar(
     mask: Any,
     lidar_path: Path,
     transform: Any | None,
+    *,
+    dst_crs: Any | None = None,
 ) -> tuple[np.ndarray, np.ndarray, str]:
     """Build a reconstruction height map using LiDAR when available.
+
+    Args:
+        mask: HxW boolean segmentation footprint.
+        lidar_path: path to a .las/.laz file.
+        transform: rasterio.Affine mapping ortho-CRS world coords to (col, row).
+        dst_crs: CRS the `transform` is in (i.e. the ortho CRS). When given
+            and it differs from the LAS file's declared CRS, LiDAR points
+            are reprojected before the inverse-affine is applied.
 
     Returns:
         height_map: float32 grid used by the mesh writer
@@ -44,6 +140,11 @@ def build_height_map_from_lidar(
 
     if xs.size == 0:
         return base_height, mask_arr, "mask"
+
+    # Reproject (xs, ys) into the ortho's CRS when we know both. This is the
+    # common case in production: LAS is in EPSG:6539, ortho is in EPSG:3857.
+    src_crs = _parse_las_crs(las)
+    xs, ys = _maybe_reproject(xs, ys, src_crs=src_crs, dst_crs=dst_crs)
 
     # Vectorized inverse-affine: world (x,y) -> raster (col,row).
     # Affine transforms from `rasterio.transform.Affine` expose .a..f coefficients

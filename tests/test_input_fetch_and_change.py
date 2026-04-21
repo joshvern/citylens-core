@@ -92,9 +92,14 @@ def test_change_stage_emits_georeferenced_geojson_when_metadata_exists(tmp_path:
     req = CitylensRequest(address="x", segmentation_backend="sam2")
     summary = PipelineSummary(request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc))
 
+    # 3x3 imagery mask (9 px — above the default 8-px noise filter). Pixel
+    # (0,0) is the top-left under an Affine.translation(100,200)*scale(2,-2),
+    # so the imagery feature spans world x [100, 106] and y [200, 194].
+    imagery = np.zeros((4, 4), dtype=np.uint8)
+    imagery[0:3, 0:3] = 1
     ctx = {
-        "mask": np.array([[1, 0], [0, 0]], dtype=np.uint8),
-        "baseline_mask": np.zeros((2, 2), dtype=np.uint8),
+        "mask": imagery,
+        "baseline_mask": np.zeros((4, 4), dtype=np.uint8),
         "orthophoto_transform": Affine.translation(100, 200) * Affine.scale(2, -2),
         "orthophoto_crs": CRS.from_epsg(3857).to_string(),
     }
@@ -103,12 +108,19 @@ def test_change_stage_emits_georeferenced_geojson_when_metadata_exists(tmp_path:
     payload = json.loads((tmp_path / "change.geojson").read_text())
 
     assert out["change_path"] == tmp_path / "change.geojson"
-    assert payload["features"][0]["properties"]["crs"] == "EPSG:3857"
-    ring = payload["features"][0]["geometry"]["coordinates"][0]
-    assert ring[0] == [100.0, 200.0]
-    assert ring[1] == [102.0, 200.0]
-    assert ring[2] == [102.0, 198.0]
-    assert ring[3] == [100.0, 198.0]
+    feats = payload["features"]
+    assert len(feats) >= 1
+    f = feats[0]
+    assert f["properties"]["kind"] == "added"
+    assert f["properties"]["crs"] == "EPSG:3857"
+    assert f["geometry"]["type"] == "Polygon"
+
+    # Ring should enclose the 3x3 world square [100..106] x [200..194].
+    ring = f["geometry"]["coordinates"][0]
+    xs = [pt[0] for pt in ring]
+    ys = [pt[1] for pt in ring]
+    assert min(xs) == 100.0 and max(xs) == 106.0
+    assert min(ys) == 194.0 and max(ys) == 200.0
 
 
 def test_refine_stage_uses_baseline_footprints_guidance(tmp_path: Path) -> None:

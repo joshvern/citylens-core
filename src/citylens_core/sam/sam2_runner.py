@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,28 @@ from .assets import Sam2AssetsMissingError, assets_root, ensure_sam2_assets
 
 class Sam2UnavailableError(RuntimeError):
     """Raised when SAM2 is not usable (missing package or missing assets)."""
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def _resolve_checkpoint_path(p: Path) -> Path:
@@ -69,7 +92,25 @@ def run_sam2_auto_mask(
     finally:
         torch.load = orig_torch_load
     try:
-        generator = SAM2AutomaticMaskGenerator(model)
+        # Default SAM2 AMG params allocate 10-20GB on CPU inference for a
+        # 1024x1024 image — far too aggressive for a Cloud Run Job.
+        # These knobs let the deployer dial the memory / quality tradeoff
+        # without changing citylens-core code. Env-var defaults below are
+        # what SAM2 itself ships with.
+        points_per_side = _int_env("CITYLENS_SAM2_POINTS_PER_SIDE", 32)
+        points_per_batch = _int_env("CITYLENS_SAM2_POINTS_PER_BATCH", 64)
+        pred_iou_thresh = _float_env("CITYLENS_SAM2_PRED_IOU_THRESH", 0.88)
+        stability_thresh = _float_env("CITYLENS_SAM2_STABILITY_SCORE_THRESH", 0.95)
+        crop_n_layers = _int_env("CITYLENS_SAM2_CROP_N_LAYERS", 0)
+
+        generator = SAM2AutomaticMaskGenerator(
+            model,
+            points_per_side=points_per_side,
+            points_per_batch=points_per_batch,
+            pred_iou_thresh=pred_iou_thresh,
+            stability_score_thresh=stability_thresh,
+            crop_n_layers=crop_n_layers,
+        )
         masks = generator.generate(image_rgb)
         h, w = image_rgb.shape[:2]
         combined = np.zeros((h, w), dtype=np.uint8)

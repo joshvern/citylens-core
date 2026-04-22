@@ -67,12 +67,17 @@ def stage_reconstruct(
     if mask is None:
         raise RuntimeError("reconstruct stage requires a segmentation mask")
 
+    lidar_debug: dict[str, Any] = {}
     height_map, footprint_mask, source = build_height_map_from_lidar(
         mask,
         work_dir / "lidar.las",
         ctx.get("orthophoto_transform"),
         dst_crs=ctx.get("orthophoto_crs"),
+        debug=lidar_debug,
     )
+    # Surface the breadcrumbs on the summary so run_summary.json answers
+    # "why did lidar fall back?" without needing worker logs.
+    summary.qa["lidar_debug"] = lidar_debug
     _write_height_mesh_ply(height_map, out_path)
 
     return {

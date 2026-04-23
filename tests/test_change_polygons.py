@@ -55,20 +55,23 @@ def test_unchanged_building_gets_unchanged_feature(tmp_path: Path, monkeypatch) 
 
 
 def test_modified_building_gets_modified_feature(tmp_path: Path, monkeypatch) -> None:
-    """Partial coverage (0.2 ≤ IoU < 0.6) → modified."""
+    """Partial coverage (modified_iou ≤ IoU < unchanged_iou) → modified."""
     monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
 
     base = np.zeros((20, 20), dtype=np.uint8)
     img = np.zeros((20, 20), dtype=np.uint8)
-    # 10x10 baseline; current mask covers only the left half (IoU ≈ 0.5).
+    # 10x10 baseline; current mask covers only ~30% (IoU ≈ 0.3). Stays
+    # comfortably in the modified range for either an unchanged_iou of
+    # 0.5 (current default) or 0.6 (historical).
     base[2:12, 2:12] = 1
-    img[2:12, 2:7] = 1
+    img[2:12, 2:5] = 1  # 3 cols of 10 → area ratio ~0.3
 
     payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
     kinds = [f["properties"]["change_type"] for f in payload["features"]]
     assert "modified" in kinds
     modified = [f for f in payload["features"] if f["properties"]["change_type"] == "modified"][0]
-    assert 0.2 <= modified["properties"]["baseline_iou"] < 0.6
+    iou = modified["properties"]["baseline_iou"]
+    assert 0.2 <= iou < 0.5, f"expected modified-band IoU, got {iou}"
     assert summary.qa["change_counts"]["modified"] == 1
 
 

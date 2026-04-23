@@ -47,7 +47,13 @@ def _min_area_m2() -> float:
 
 
 def _unchanged_iou() -> float:
-    return _float_env("CITYLENS_CHANGE_UNCHANGED_IOU", 0.6)
+    # Calibrated against real Brooklyn data (see research/change_threshold_calibration.md):
+    # SAM2's IoU distribution vs NYC GDB footprints is unimodal, peaked at
+    # 0.5. That's not noise — it's a structural mismatch (roof edges vs
+    # ground-level footprints at ~1m resolution). 0.6 was too strict and
+    # swept real "unchanged" buildings into a "modified" bucket they didn't
+    # belong in. 0.5 matches the distribution.
+    return _float_env("CITYLENS_CHANGE_UNCHANGED_IOU", 0.5)
 
 
 def _modified_iou() -> float:

@@ -70,6 +70,30 @@ def _added_max_baseline_overlap() -> float:
     return _float_env("CITYLENS_CHANGE_ADDED_MAX_BASELINE_OVERLAP", 0.1)
 
 
+def _added_min_height_m() -> float:
+    """LiDAR height gate on 'added' components.
+
+    A candidate new building must rise at least this many meters above the
+    ground plane. Kills the most common SAM2 false positives — trees,
+    hedges, vehicles, shadows, pavement patterns — without needing a
+    separate classifier. Default 2 m (shorter than a 1-story building,
+    taller than a van).
+
+    Only applied when the pipeline has a usable LiDAR heights grid.
+    Without LiDAR we don't have height information, so all candidate
+    components pass this gate (soft fail).
+    """
+    return _float_env("CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M", 2.0)
+
+
+def _added_height_percentile() -> float:
+    """Percentile of LiDAR z-values within a candidate 'added' footprint to
+    compare against the ground plane. Using the 75th percentile (instead
+    of the max) makes the gate robust against single tall trees/antennas
+    poking through an otherwise-flat patch of grass."""
+    return _float_env("CITYLENS_CHANGE_ADDED_HEIGHT_PERCENTILE", 75.0)
+
+
 # ----------------------------------------------------------------------
 # Geometry helpers
 # ----------------------------------------------------------------------
@@ -459,24 +483,49 @@ def stage_change(
     # 2. Find "added" buildings — components in imagery that don't overlap
     #    any baseline footprint.
     # ------------------------------------------------------------------
+    # LiDAR height gate. Pulled from ctx if refine managed to sample a
+    # dense grid; `None` means "no LiDAR available, don't reject on height".
+    lidar_heights = ctx.get("lidar_heights")
+    lidar_ground_z = ctx.get("lidar_ground_z")
+    added_min_height_m = _added_min_height_m()
+    added_height_pctl = _added_height_percentile()
+    added_reject_reasons = {"too_small": 0, "baseline_overlap": 0, "too_short": 0}
+
     added_pixels = np.logical_and(im, np.logical_not(base))
     added_labels, added_n = _label_components(added_pixels)
     for comp_id in range(1, added_n + 1):
         comp = added_labels == comp_id
         comp_area_px = int(comp.sum())
         if comp_area_px < min_area_px:
+            added_reject_reasons["too_small"] += 1
             continue
 
-        # Reject slivers along existing baseline buildings: if more than
-        # `added_overlap_cap` of this component's area touches the dilated
-        # baseline (i.e. the SAM2 blob that overlaps an existing building
-        # leaked past the footprint boundary), don't treat it as new.
-        # Cheap proxy: any pixel in `comp` that neighbors a `base` pixel
-        # is counted as "touching".
+        # Reject slivers along existing baseline buildings.
         overlap_touching = int(np.logical_and(comp, _one_step_dilate(base)).sum())
         overlap_fraction = float(overlap_touching) / float(comp_area_px) if comp_area_px else 1.0
         if overlap_fraction > added_overlap_cap:
+            added_reject_reasons["baseline_overlap"] += 1
             continue
+
+        # Reject things SAM2 thinks are buildings but which LiDAR says are
+        # short — trees, hedges, vehicles, pavement patterns. Only gated
+        # when we have LiDAR + a ground-plane estimate.
+        if lidar_heights is not None and lidar_ground_z is not None:
+            cell_heights = np.asarray(lidar_heights)[comp]
+            finite = cell_heights[np.isfinite(cell_heights)]
+            if finite.size == 0:
+                # No LiDAR coverage for this component. Err on the side of
+                # rejecting: in a real NYC scene the LiDAR tile usually
+                # covers real buildings. If it doesn't cover this blob,
+                # the blob is probably outside the tile's footprint too.
+                added_reject_reasons["too_short"] += 1
+                continue
+            pctl_z = float(np.percentile(finite, added_height_pctl))
+            # sample_lidar_heights returns meters already, no unit conversion.
+            height_above_ground_m = pctl_z - float(lidar_ground_z)
+            if height_above_ground_m < added_min_height_m:
+                added_reject_reasons["too_short"] += 1
+                continue
 
         counts["added"] += 1
         area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
@@ -500,6 +549,10 @@ def stage_change(
     # Surface breakdown on summary.qa so operators can eyeball noise levels
     # without parsing the geojson.
     summary.qa["change_counts"] = dict(counts)
+    # Why the "added" gate rejected candidates — diagnostic signal for
+    # tuning. Empty buckets are fine. total = rejected; accepted is
+    # change_counts["added"].
+    summary.qa["added_rejected"] = dict(added_reject_reasons)
 
     change_mask = np.logical_or(
         np.logical_and(im, np.logical_not(base)),

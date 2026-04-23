@@ -8,6 +8,7 @@ import rasterio
 
 from ..models import CitylensRequest, PipelineSummary
 from ..io.geo import clean_binary_mask, geojson_crs_hint, load_geojson_mask
+from ..io.lidar import sample_lidar_heights
 
 
 def _load_orthophoto_geometry(ctx: dict[str, Any], work_dir: Path) -> tuple[tuple[int, int] | None, Any | None, str | None]:
@@ -106,5 +107,20 @@ def stage_refine(
         out["orthophoto_crs"] = crs
     if transform is not None:
         out["orthophoto_transform"] = transform
+
+    # Sample a dense LiDAR height grid once (before change + reconstruct) so
+    # both stages can query per-footprint heights without re-reading the LAS
+    # file twice. This is how stage_change's "added" filter validates that
+    # candidate new buildings are actually tall (real building) vs flat
+    # (tree shadow, pavement, vehicle, etc.).
+    if shape is not None and transform is not None:
+        lidar_path = work_dir / "lidar.las"
+        sampled = sample_lidar_heights(
+            lidar_path, transform, shape=shape, dst_crs=crs,
+        )
+        if sampled is not None:
+            heights, ground_z = sampled
+            out["lidar_heights"] = heights
+            out["lidar_ground_z"] = ground_z
 
     return out

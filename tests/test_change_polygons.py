@@ -359,3 +359,128 @@ def test_per_source_feature_requires_transform(tmp_path: Path, monkeypatch) -> N
     payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
     # No transform -> pixel_space_only -> component-labeled fallback.
     assert summary.qa["change_source"] == "component_labeled"
+
+
+def test_lidar_height_gate_rejects_short_added_components(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An 'added' candidate whose LiDAR height is below the threshold is
+    rejected. Simulates a tree/shadow/pavement blob SAM2 segmented."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M", "2.0")
+
+    # 5x5 isolated component in imagery, empty baseline → would be 'added'.
+    base = np.zeros((30, 30), dtype=np.uint8)
+    img = np.zeros((30, 30), dtype=np.uint8)
+    img[10:15, 10:15] = 1
+
+    # LiDAR heights grid with ALL values at 0.5m above ground. Clearly below
+    # the 2m threshold → reject.
+    heights = np.full((30, 30), 1.5, dtype=np.float32)
+    ground = 1.0  # 0.5m above ground
+
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.change import stage_change
+
+    req = CitylensRequest(
+        address="x", segmentation_backend="sam2",
+        imagery_year=2024, baseline_year=2017,
+    )
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc),
+    )
+    ctx = {
+        "mask": img, "baseline_mask": base,
+        "lidar_heights": heights, "lidar_ground_z": ground,
+    }
+    stage_change(req, tmp_path, ctx, summary)
+    assert summary.qa["change_counts"]["added"] == 0
+    assert summary.qa["added_rejected"]["too_short"] == 1
+
+
+def test_lidar_height_gate_accepts_tall_added_components(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An 'added' candidate whose LiDAR height clears the threshold is kept."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M", "2.0")
+
+    base = np.zeros((30, 30), dtype=np.uint8)
+    img = np.zeros((30, 30), dtype=np.uint8)
+    img[10:15, 10:15] = 1
+
+    # 10m above ground — a real one-story building.
+    heights = np.full((30, 30), 10.0, dtype=np.float32)
+    ground = 0.0
+
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.change import stage_change
+
+    req = CitylensRequest(
+        address="x", segmentation_backend="sam2",
+        imagery_year=2024, baseline_year=2017,
+    )
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc),
+    )
+    ctx = {
+        "mask": img, "baseline_mask": base,
+        "lidar_heights": heights, "lidar_ground_z": ground,
+    }
+    stage_change(req, tmp_path, ctx, summary)
+    assert summary.qa["change_counts"]["added"] == 1
+    assert summary.qa["added_rejected"]["too_short"] == 0
+
+
+def test_lidar_height_gate_skipped_when_lidar_absent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Without LiDAR on ctx, the gate doesn't run and components pass
+    based on area + overlap filters alone (legacy behavior)."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+
+    base = np.zeros((30, 30), dtype=np.uint8)
+    img = np.zeros((30, 30), dtype=np.uint8)
+    img[10:15, 10:15] = 1
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    assert summary.qa["change_counts"]["added"] == 1
+    assert summary.qa["added_rejected"] == {
+        "too_small": 0, "baseline_overlap": 0, "too_short": 0,
+    }
+
+
+def test_lidar_height_gate_rejects_when_component_has_no_lidar_coverage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Component with no in-bounds LiDAR points is rejected — we can't
+    verify it's a building, so err on the side of precision over recall."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M", "2.0")
+
+    base = np.zeros((30, 30), dtype=np.uint8)
+    img = np.zeros((30, 30), dtype=np.uint8)
+    img[20:25, 20:25] = 1   # component in lower-right
+
+    # LiDAR grid is all NaN in the component region.
+    heights = np.full((30, 30), np.nan, dtype=np.float32)
+    heights[0:5, 0:5] = 10.0   # LiDAR covers a DIFFERENT region
+    ground = 0.0
+
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.change import stage_change
+
+    req = CitylensRequest(
+        address="x", segmentation_backend="sam2",
+        imagery_year=2024, baseline_year=2017,
+    )
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc),
+    )
+    ctx = {
+        "mask": img, "baseline_mask": base,
+        "lidar_heights": heights, "lidar_ground_z": ground,
+    }
+    stage_change(req, tmp_path, ctx, summary)
+    assert summary.qa["change_counts"]["added"] == 0
+    assert summary.qa["added_rejected"]["too_short"] == 1

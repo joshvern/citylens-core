@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-__all__ = ["build_height_map_from_lidar"]
+__all__ = ["build_height_map_from_lidar", "sample_lidar_heights"]
 
 _logger = logging.getLogger(__name__)
 
@@ -227,3 +227,117 @@ def build_height_map_from_lidar(
     debug["z_min"] = float(np.min(height_map[finite]))
     debug["z_max"] = float(np.max(height_map[finite]))
     return blended, coverage_mask, "lidar"
+
+
+def _las_vertical_unit_to_meters(las: Any) -> float:
+    """Multiplier to convert LAS z values into meters.
+
+    NYS NYC TopoBathymetric LiDAR ships in a compound CRS whose vertical
+    component is NAVD88 in US survey feet (EPSG:5703 variants). Without
+    converting, a 10 m building registers as ~33 m — breaks any height
+    threshold that's expressed in meters.
+
+    Best-effort: inspect the compound CRS parsed from the LAS header and
+    look at the vertical sub-CRS' axis_info[0].unit_name. Returns 1.0 if
+    we can't prove it's feet (i.e. assume meters, the LAS standard default).
+    """
+    src_crs = _parse_las_crs(las)
+    if src_crs is None:
+        return 1.0
+    try:
+        # Compound CRS: pyproj exposes .sub_crs_list with the vertical CRS at index 1.
+        sub = getattr(src_crs, "sub_crs_list", None) or []
+        for candidate in sub:
+            axis_info = getattr(candidate, "axis_info", None) or []
+            for axis in axis_info:
+                name = (getattr(axis, "unit_name", "") or "").lower()
+                if "survey foot" in name or "us survey foot" in name or "ftus" in name:
+                    return 0.3048006096012192
+                if "foot" in name and "meter" not in name:
+                    # International foot (rare but exists in some datasets).
+                    return 0.3048
+                if "metre" in name or "meter" in name:
+                    return 1.0
+    except Exception:
+        pass
+    return 1.0
+
+
+def sample_lidar_heights(
+    lidar_path: Path,
+    transform: Any,
+    *,
+    shape: tuple[int, int],
+    dst_crs: Any | None = None,
+) -> tuple[np.ndarray, float] | None:
+    """Project a LiDAR point cloud onto a pixel grid and return max-z per cell.
+
+    Unlike `build_height_map_from_lidar`, this doesn't take a segmentation
+    mask — it returns the full grid so downstream code (change filter,
+    per-building extrusion) can query any bbox.
+
+    z values are converted to METERS regardless of the LAS vertical unit
+    (NYS LiDAR ships in US survey feet; callers want meters to match the
+    pipeline's other m-based thresholds).
+
+    Returns (heights_m, ground_z_m) where:
+      - heights_m: float32 array of `shape`, filled with NaN where no LiDAR
+        point landed and max-z-in-meters otherwise.
+      - ground_z_m: 5th-percentile z (meters) across all in-bounds LiDAR
+        points. Ground-plane reference for above-ground-height comparisons.
+    Returns None if LiDAR isn't usable (missing file, laspy not installed,
+    read failure, zero points, reprojection impossible, etc).
+    """
+    lidar_path = Path(lidar_path)
+    if not lidar_path.exists() or transform is None:
+        return None
+
+    try:
+        import laspy
+    except Exception:
+        return None
+
+    try:
+        las = laspy.read(str(lidar_path))
+        xs = np.asarray(las.x, dtype=np.float64)
+        ys = np.asarray(las.y, dtype=np.float64)
+        zs = np.asarray(las.z, dtype=np.float32)
+    except Exception:
+        return None
+
+    if xs.size == 0:
+        return None
+
+    src_crs = _parse_las_crs(las)
+    xs, ys = _maybe_reproject(xs, ys, src_crs=src_crs, dst_crs=dst_crs)
+
+    # Convert z to meters once, before any downstream comparison.
+    z_unit_m = _las_vertical_unit_to_meters(las)
+    zs = (zs * np.float32(z_unit_m)).astype(np.float32)
+
+    inv = ~transform
+    cols_f = inv.a * xs + inv.b * ys + inv.c
+    rows_f = inv.d * xs + inv.e * ys + inv.f
+    cols = np.floor(cols_f).astype(np.int64)
+    rows = np.floor(rows_f).astype(np.int64)
+
+    h, w = shape
+    in_bounds = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+    if not np.any(in_bounds):
+        return None
+
+    rows_ib = rows[in_bounds]
+    cols_ib = cols[in_bounds]
+    zs_ib = zs[in_bounds]
+
+    heights = np.full(shape, np.nan, dtype=np.float32)
+    heights_pos = np.full(shape, -np.inf, dtype=np.float32)
+    np.maximum.at(heights_pos, (rows_ib, cols_ib), zs_ib)
+    finite = np.isfinite(heights_pos)
+    heights[finite] = heights_pos[finite]
+
+    if not np.any(finite):
+        return None
+
+    ground_z = float(np.percentile(zs_ib, 5))
+    return heights, ground_z

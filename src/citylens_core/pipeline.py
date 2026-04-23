@@ -178,17 +178,43 @@ def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -
         change_path = ctx.get("change_path")
         if change_path is not None and ref_mask is not None and baseline_mask is not None:
             try:
+                import json as _json
                 from rasterio.transform import Affine
+                from rasterio.features import rasterize
 
                 change_transform = ctx.get("orthophoto_transform")
                 if change_transform is None:
                     change_transform = Affine.identity()
-                predicted_change = load_geojson_mask(
-                    Path(change_path),
-                    out_shape=tuple(np.asarray(ref_mask).shape),  # type: ignore[name-defined]
-                    transform=change_transform,
-                    pixel_space=str(ctx.get("orthophoto_crs") or "").strip().lower() in {"", "pixel"},
-                )
+
+                # Rasterize ONLY features that describe real change
+                # (added / demolished / modified). "unchanged" features
+                # are also written to change.geojson for UI purposes but
+                # should not count against the change-XOR reference.
+                change_types = {"added", "demolished", "modified"}
+                gj = _json.loads(Path(change_path).read_text())
+                geoms = []
+                for feat in gj.get("features") or []:
+                    props = feat.get("properties") or {}
+                    if str(props.get("change_type", "")).lower() not in change_types:
+                        continue
+                    geom = feat.get("geometry")
+                    if geom:
+                        geoms.append((geom, 1))
+
+                out_shape = tuple(np.asarray(ref_mask).shape)  # type: ignore[name-defined]
+                if geoms:
+                    predicted_change = rasterize(
+                        shapes=geoms,
+                        out_shape=out_shape,
+                        transform=change_transform,
+                        fill=0,
+                        default_value=1,
+                        all_touched=False,
+                        dtype="uint8",
+                    ).astype(bool)
+                else:
+                    predicted_change = np.zeros(out_shape, dtype=bool)
+
                 reference_change = np.logical_xor(
                     np.asarray(ref_mask).astype(bool),
                     np.asarray(baseline_mask).astype(bool),

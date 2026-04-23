@@ -85,21 +85,28 @@ def test_stage_fetch_downloads_url_inputs_into_work_dir(tmp_path: Path, monkeypa
     assert ctx["lidar_sha256"] == hashlib.sha256(b"lidar-bytes").hexdigest()
 
 
-def test_change_stage_emits_georeferenced_geojson_when_metadata_exists(tmp_path: Path) -> None:
+def test_change_stage_emits_georeferenced_geojson_when_metadata_exists(
+    tmp_path: Path, monkeypatch
+) -> None:
     from citylens_core.models import CitylensRequest, PipelineSummary
     from citylens_core.stages.change import stage_change
 
     req = CitylensRequest(address="x", segmentation_backend="sam2")
     summary = PipelineSummary(request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc))
 
-    # 3x3 imagery mask (9 px — above the default 8-px noise filter). Pixel
-    # (0,0) is the top-left under an Affine.translation(100,200)*scale(2,-2),
-    # so the imagery feature spans world x [100, 106] and y [200, 194].
-    imagery = np.zeros((4, 4), dtype=np.uint8)
+    # Per-building classification now gates features by min-area; the
+    # georeferenced path uses m² not px, so override both.
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+
+    # Isolated 3x3 current-year building with an empty baseline — should be
+    # classified as `added`. Transform puts pixel (0,0) at world (100,200)
+    # with 2m/px scale, so the feature spans world x [100..106], y [200..194].
+    imagery = np.zeros((5, 5), dtype=np.uint8)
     imagery[0:3, 0:3] = 1
     ctx = {
         "mask": imagery,
-        "baseline_mask": np.zeros((4, 4), dtype=np.uint8),
+        "baseline_mask": np.zeros((5, 5), dtype=np.uint8),
         "orthophoto_transform": Affine.translation(100, 200) * Affine.scale(2, -2),
         "orthophoto_crs": CRS.from_epsg(3857).to_string(),
     }
@@ -109,13 +116,14 @@ def test_change_stage_emits_georeferenced_geojson_when_metadata_exists(tmp_path:
 
     assert out["change_path"] == tmp_path / "change.geojson"
     feats = payload["features"]
-    assert len(feats) >= 1
+    assert len(feats) == 1
     f = feats[0]
-    assert f["properties"]["kind"] == "added"
+    assert f["properties"]["change_type"] == "added"
     assert f["properties"]["crs"] == "EPSG:3857"
+    # `added` features don't carry a baseline_iou (no prior building to compare to).
+    assert f["properties"].get("baseline_iou") is None
     assert f["geometry"]["type"] == "Polygon"
 
-    # Ring should enclose the 3x3 world square [100..106] x [200..194].
     ring = f["geometry"]["coordinates"][0]
     xs = [pt[0] for pt in ring]
     ys = [pt[1] for pt in ring]

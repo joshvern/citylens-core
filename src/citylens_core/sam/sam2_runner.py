@@ -144,23 +144,51 @@ def run_sam2_auto_mask(
             pass
 
 
-def _label_components(mask: np.ndarray) -> np.ndarray:
+def _label_components(mask: np.ndarray) -> tuple[np.ndarray, int]:
     """Return (labels, n) where labels[i,j]==k for cell in component k (1..n).
 
-    Uses scipy.ndimage.label when available (fast, 8-connected), falls back
-    to a pure-numpy flood-fill via skimage if not. Both are already in the
-    core dependency tree via rasterio's transitive deps.
+    Implementation uses rasterio.features.shapes (already a core dep — no
+    scipy or scikit-image required). It's slightly slower than
+    scipy.ndimage.label at huge scales, but for the 40–500 building
+    footprints in a typical 1024x1024 ortho tile the overhead is negligible
+    and we avoid bloating the worker image with extra ML deps.
     """
-    try:
-        from scipy.ndimage import label
+    from rasterio.features import shapes
 
-        labels, n = label(mask, structure=np.ones((3, 3), dtype=bool))
-        return labels.astype(np.int64), int(n)
-    except Exception:
-        from skimage.measure import label as sk_label
+    m = np.asarray(mask).astype(bool)
+    h, w = m.shape
+    labels = np.zeros((h, w), dtype=np.int64)
+    if not m.any():
+        return labels, 0
 
-        labels = sk_label(mask.astype(bool), connectivity=2)
-        return labels.astype(np.int64), int(labels.max())
+    m_u8 = m.astype("uint8")
+    n = 0
+    # `shapes` emits (geometry, value) per connected component of matching
+    # value cells. Passing mask=m limits it to True cells only. Identity
+    # transform keeps everything in pixel space.
+    from rasterio.transform import Affine as _Affine
+    from rasterio.features import rasterize
+
+    for geom, value in shapes(m_u8, mask=m, transform=_Affine.identity()):
+        if int(value) != 1:
+            continue
+        n += 1
+        # Rasterize this single component back into `labels` with id = n.
+        comp_mask = rasterize(
+            shapes=[(geom, 1)],
+            out_shape=(h, w),
+            transform=_Affine.identity(),
+            fill=0,
+            default_value=1,
+            all_touched=False,
+            dtype="uint8",
+        ).astype(bool)
+        # Clip to the original mask in case `shapes` produced pixel-ish
+        # boundary rounding that leaks into non-True cells.
+        comp_mask &= m
+        labels[comp_mask] = n
+
+    return labels, n
 
 
 def run_sam2_baseline_prompted(

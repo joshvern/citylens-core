@@ -173,6 +173,7 @@ def _feature(
     imagery_year: int,
     baseline_year: int,
     crs_value: str,
+    extra_props: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     props: dict[str, Any] = {
         "change_type": change_type,
@@ -184,11 +185,80 @@ def _feature(
         props["baseline_iou"] = round(float(baseline_iou), 4)
     if area_m2 is not None:
         props["area_m2"] = round(float(area_m2), 1)
+    if extra_props:
+        # Carry source-feature provenance (e.g. source_gdb, SourceDate) onto
+        # the output so UI layers can show "from 2017 NYC OpenData" per row.
+        for k, v in extra_props.items():
+            if k in props:
+                continue  # never let provenance shadow computed fields
+            props[k] = v
     return {
         "type": "Feature",
         "properties": props,
         "geometry": {"type": "Polygon", "coordinates": coordinates},
     }
+
+
+# ----------------------------------------------------------------------
+# Per-source-feature classification helpers
+# ----------------------------------------------------------------------
+
+
+def _load_baseline_source_features(work_dir: Path) -> list[dict[str, Any]] | None:
+    """Load baseline_footprints.geojson features when the worker materialized
+    one. Returns None when the file doesn't exist (tests, non-NYC paths)."""
+    gj_path = work_dir / "baseline_footprints.geojson"
+    if not gj_path.exists():
+        return None
+    try:
+        payload = json.loads(gj_path.read_text())
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    feats = payload.get("features")
+    if not isinstance(feats, list):
+        return None
+    return [f for f in feats if isinstance(f, dict) and f.get("geometry")]
+
+
+def _rasterize_single_geom(
+    geom: dict[str, Any],
+    *,
+    out_shape: tuple[int, int],
+    transform: Any | None,
+) -> Any:
+    """Rasterize one GeoJSON geometry into a boolean mask at `out_shape`.
+
+    Returns an all-False mask when rasterization fails (bad geometry,
+    no overlap with out_shape, etc).
+    """
+    import numpy as np
+    from rasterio.features import rasterize
+    from rasterio.transform import Affine
+
+    tr = transform if transform is not None else Affine.identity()
+    try:
+        mask_u8 = rasterize(
+            shapes=[(geom, 1)],
+            out_shape=out_shape,
+            transform=tr,
+            fill=0,
+            default_value=1,
+            all_touched=False,
+            dtype="uint8",
+        )
+        return mask_u8.astype(bool)
+    except Exception:
+        return np.zeros(out_shape, dtype=bool)
+
+
+def _extract_source_provenance(source_props: Any) -> dict[str, Any]:
+    """Pick the small set of GDB-provenance fields worth forwarding."""
+    if not isinstance(source_props, dict):
+        return {}
+    keep = ("source_gdb", "source_layer", "Source", "SourceDate", "NYSGeo_Source")
+    return {k: source_props[k] for k in keep if k in source_props}
 
 
 # ----------------------------------------------------------------------
@@ -255,56 +325,129 @@ def stage_change(
     # ------------------------------------------------------------------
     # 1. Classify each baseline footprint
     # ------------------------------------------------------------------
-    baseline_labels, baseline_n = _label_components(base)
-    for comp_id in range(1, baseline_n + 1):
-        comp = baseline_labels == comp_id
-        comp_area_px = int(comp.sum())
-        if comp_area_px < 1:
-            continue
+    # Prefer iterating the source GeoJSON features directly: one output
+    # feature per GDB row (44 outputs for a Brooklyn block). If the worker
+    # didn't materialize the geojson (unit tests, non-NYC paths), fall back
+    # to component-labeling the rasterized baseline mask.
+    source_features = _load_baseline_source_features(work_dir)
+    used_per_source = False
 
-        # IoU between this baseline footprint and the SAM2 mask, measured
-        # inside the bounding box of the footprint. This avoids a single
-        # giant current-mask swallowing many small baseline footprints.
-        ys, xs = np.where(comp)
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        # Dilate the bbox slightly (10%) so a building that shifted by a
-        # few pixels still gets counted as the same feature.
-        pad_y = max(1, (y1 - y0) // 10)
-        pad_x = max(1, (x1 - x0) // 10)
-        y0 = max(0, y0 - pad_y)
-        x0 = max(0, x0 - pad_x)
-        y1 = min(comp.shape[0], y1 + pad_y)
-        x1 = min(comp.shape[1], x1 + pad_x)
-
-        comp_roi = comp[y0:y1, x0:x1]
-        im_roi = im[y0:y1, x0:x1]
-        inter = int(np.logical_and(comp_roi, im_roi).sum())
-        union = int(np.logical_or(comp_roi, im_roi).sum())
-        iou = float(inter) / float(union) if union > 0 else 0.0
-
-        if iou >= unchanged_thresh:
-            change_type = "unchanged"
-        elif iou >= modified_thresh:
-            change_type = "modified"
-        else:
-            change_type = "demolished"
-        counts[change_type] += 1
-
-        area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
-        polys = _polygon_coords_from_pixel_mask(comp, transform=transform)
-        for coordinates in polys:
-            features.append(
-                _feature(
-                    change_type=change_type,
-                    coordinates=coordinates,
-                    area_m2=area_m2_val,
-                    baseline_iou=iou,
-                    imagery_year=request.imagery_year,
-                    baseline_year=request.baseline_year,
-                    crs_value=crs_value,
-                )
+    if source_features is not None and not pixel_space_only:
+        used_per_source = True
+        summary.qa["change_source"] = "per_source_feature"
+        h, w = im.shape
+        for src_feat in source_features:
+            geom = src_feat.get("geometry")
+            if not geom:
+                continue
+            single_mask = _rasterize_single_geom(
+                geom, out_shape=(h, w), transform=transform
             )
+            single_area_px = int(single_mask.sum())
+            if single_area_px < 1:
+                # Footprint falls outside the ortho bbox — can't classify.
+                continue
+
+            # IoU measured within the footprint's bbox (pad 10%) so a
+            # single large SAM2 blob can't swallow every neighbor.
+            ys, xs = np.where(single_mask)
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            pad_y = max(1, (y1 - y0) // 10)
+            pad_x = max(1, (x1 - x0) // 10)
+            y0 = max(0, y0 - pad_y)
+            x0 = max(0, x0 - pad_x)
+            y1 = min(h, y1 + pad_y)
+            x1 = min(w, x1 + pad_x)
+            fp_roi = single_mask[y0:y1, x0:x1]
+            im_roi = im[y0:y1, x0:x1]
+            inter = int(np.logical_and(fp_roi, im_roi).sum())
+            union = int(np.logical_or(fp_roi, im_roi).sum())
+            iou = float(inter) / float(union) if union > 0 else 0.0
+
+            if iou >= unchanged_thresh:
+                change_type = "unchanged"
+            elif iou >= modified_thresh:
+                change_type = "modified"
+            else:
+                change_type = "demolished"
+            counts[change_type] += 1
+
+            area_m2_val = float(single_area_px) * px_area_m2 if px_area_m2 > 0 else None
+            provenance = _extract_source_provenance(src_feat.get("properties"))
+
+            # Emit the footprint geometry verbatim from the source geojson
+            # (preserves shared edges of row houses instead of bleeding into
+            # the neighbor via rasterize+shapes).
+            src_type = str(geom.get("type", "")).strip()
+            src_coords = geom.get("coordinates")
+            if src_type == "Polygon" and src_coords:
+                poly_list = [src_coords]
+            elif src_type == "MultiPolygon" and src_coords:
+                poly_list = list(src_coords)
+            else:
+                poly_list = []
+
+            for coordinates in poly_list:
+                features.append(
+                    _feature(
+                        change_type=change_type,
+                        coordinates=coordinates,
+                        area_m2=area_m2_val,
+                        baseline_iou=iou,
+                        imagery_year=request.imagery_year,
+                        baseline_year=request.baseline_year,
+                        crs_value=crs_value,
+                        extra_props=provenance,
+                    )
+                )
+    else:
+        summary.qa["change_source"] = "component_labeled"
+        baseline_labels, baseline_n = _label_components(base)
+        for comp_id in range(1, baseline_n + 1):
+            comp = baseline_labels == comp_id
+            comp_area_px = int(comp.sum())
+            if comp_area_px < 1:
+                continue
+
+            ys, xs = np.where(comp)
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            pad_y = max(1, (y1 - y0) // 10)
+            pad_x = max(1, (x1 - x0) // 10)
+            y0 = max(0, y0 - pad_y)
+            x0 = max(0, x0 - pad_x)
+            y1 = min(comp.shape[0], y1 + pad_y)
+            x1 = min(comp.shape[1], x1 + pad_x)
+
+            comp_roi = comp[y0:y1, x0:x1]
+            im_roi = im[y0:y1, x0:x1]
+            inter = int(np.logical_and(comp_roi, im_roi).sum())
+            union = int(np.logical_or(comp_roi, im_roi).sum())
+            iou = float(inter) / float(union) if union > 0 else 0.0
+
+            if iou >= unchanged_thresh:
+                change_type = "unchanged"
+            elif iou >= modified_thresh:
+                change_type = "modified"
+            else:
+                change_type = "demolished"
+            counts[change_type] += 1
+
+            area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
+            polys = _polygon_coords_from_pixel_mask(comp, transform=transform)
+            for coordinates in polys:
+                features.append(
+                    _feature(
+                        change_type=change_type,
+                        coordinates=coordinates,
+                        area_m2=area_m2_val,
+                        baseline_iou=iou,
+                        imagery_year=request.imagery_year,
+                        baseline_year=request.baseline_year,
+                        crs_value=crs_value,
+                    )
+                )
 
     # ------------------------------------------------------------------
     # 2. Find "added" buildings — components in imagery that don't overlap

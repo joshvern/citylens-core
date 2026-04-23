@@ -283,3 +283,90 @@ def test_reconstruct_lod1_emits_per_building_extrusions(
     assert summary.qa["mesh_stats"]["skipped_demolished"] == 1
     # The roof samples at 25 m should round-trip through the PLY text.
     assert "25.0" in mesh_text
+
+
+def test_render_change_aware_preview(tmp_path: Path) -> None:
+    from PIL import Image
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.render import stage_render
+
+    req = CitylensRequest(
+        address="x",
+        segmentation_backend="sam2",
+        imagery_year=2024,
+        baseline_year=2017,
+    )
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc)
+    )
+    summary.qa["change_counts"] = {
+        "unchanged": 1,
+        "modified": 0,
+        "demolished": 1,
+        "added": 1,
+    }
+
+    # 256x256 gray orthophoto (large enough that legend+year label don't
+    # overwrite the polygons we're asserting on).
+    ortho_path = tmp_path / "orthophoto.png"
+    Image.new("RGB", (256, 256), color=(80, 80, 80)).save(ortho_path)
+
+    change_path = tmp_path / "change.geojson"
+    change_path.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"change_type": "unchanged"},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [[40, 40], [60, 40], [60, 60], [40, 60], [40, 40]]
+                            ],
+                        },
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {"change_type": "added"},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [[80, 80], [100, 80], [100, 100], [80, 100], [80, 80]]
+                            ],
+                        },
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {"change_type": "demolished"},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [[130, 80], [150, 80], [150, 100], [130, 100], [130, 80]]
+                            ],
+                        },
+                    },
+                ],
+            }
+        )
+    )
+
+    ctx = {
+        "orthophoto_path": ortho_path,
+        "orthophoto_transform": Affine.identity(),
+        "change_path": change_path,
+        "mask": np.ones((256, 256), dtype=np.uint8),
+    }
+
+    out = stage_render(req, tmp_path, ctx, summary)
+    preview = Image.open(out["preview_path"]).convert("RGBA")
+    pixels = np.array(preview)
+
+    assert summary.qa["preview_source"] == "change_classified"
+    # Green-dominant pixels (added) should exist in the added region.
+    added_region = pixels[82:98, 82:98]
+    assert (added_region[..., 1] > added_region[..., 0]).any()
+    # Red-dominant pixels (demolished) should exist in the demolished region.
+    demo_region = pixels[82:98, 132:148]
+    assert (demo_region[..., 0] > demo_region[..., 1]).any()

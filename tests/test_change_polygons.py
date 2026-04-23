@@ -202,3 +202,157 @@ def test_feature_schema_has_all_expected_fields(tmp_path: Path, monkeypatch) -> 
     assert props["imagery_year"] == 2024
     assert props["baseline_year"] == 2017
     assert "baseline_iou" in props  # set for unchanged/modified/demolished
+
+
+def _write_baseline_geojson(tmp_path, features):
+    """Helper: materialize a baseline_footprints.geojson the stage can read.
+
+    Uses a pixel-space CRS hint so tests don't have to supply a real transform
+    for rasterization. Each feature's geometry must be in pixel coords.
+    """
+    payload = {
+        "type": "FeatureCollection",
+        "crs": "pixel",
+        "features": features,
+    }
+    (tmp_path / "baseline_footprints.geojson").write_text(json.dumps(payload))
+
+
+def test_per_source_feature_splits_adjacent_row_houses(tmp_path: Path, monkeypatch) -> None:
+    """Regression: two adjacent row-house footprints that share a wall merge
+    into a single component when rasterized, hiding a 2:1 undercount in the
+    baseline. The per-source-feature path keeps them separate."""
+    from affine import Affine
+
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "0.01")  # ~any size passes
+    # Scale=1 means 1 pixel == 1 "m" so px_area_m2 == 1 in this test.
+
+    # Two adjacent row houses, each 6x6, sharing the edge at x=9.
+    # Pixel coords (col,row):   A = (3..8, 2..7)     B = (9..14, 2..7)
+    # Baseline raster built from these has them touching -> one component.
+    feat_a = {
+        "type": "Feature",
+        "properties": {"Source": "NYC OpenData", "SourceDate": "2017-01-01"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[3, 2], [9, 2], [9, 8], [3, 8], [3, 2]]],
+        },
+    }
+    feat_b = {
+        "type": "Feature",
+        "properties": {"Source": "NYC OpenData", "SourceDate": "2017-01-01"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[9, 2], [15, 2], [15, 8], [9, 8], [9, 2]]],
+        },
+    }
+    _write_baseline_geojson(tmp_path, [feat_a, feat_b])
+
+    # Baseline pixel mask = union of the two row houses.
+    base = np.zeros((20, 20), dtype=np.uint8)
+    base[2:8, 3:15] = 1
+    # Current-year imagery still has both houses (IoU ≈ 1 for each).
+    img = np.zeros((20, 20), dtype=np.uint8)
+    img[2:8, 3:15] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path, mask=img, baseline_mask=base,
+        transform=Affine.identity(), crs="EPSG:3857",
+    )
+
+    # Per-source path must be engaged.
+    assert summary.qa["change_source"] == "per_source_feature"
+    # TWO features, one per row house — NOT one merged component.
+    assert len(payload["features"]) == 2
+    assert summary.qa["change_counts"]["unchanged"] == 2
+
+    # Provenance is preserved.
+    for f in payload["features"]:
+        assert f["properties"].get("Source") == "NYC OpenData"
+        assert f["properties"].get("SourceDate") == "2017-01-01"
+        # Provenance doesn't shadow computed fields.
+        assert f["properties"]["change_type"] == "unchanged"
+
+
+def test_per_source_feature_fallback_when_no_geojson(tmp_path: Path, monkeypatch) -> None:
+    """Without baseline_footprints.geojson on disk, stage falls back to the
+    component-labeling path and still produces valid output."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+
+    base = np.zeros((20, 20), dtype=np.uint8)
+    img = np.zeros((20, 20), dtype=np.uint8)
+    base[5:15, 5:15] = 1
+    img[5:15, 5:15] = 1
+    # NOTE: no baseline_footprints.geojson written.
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    assert summary.qa["change_source"] == "component_labeled"
+    assert summary.qa["change_counts"]["unchanged"] == 1
+
+
+def test_per_source_feature_handles_multipolygon_geometry(tmp_path: Path, monkeypatch) -> None:
+    """MultiPolygon source features emit one output feature per outer ring —
+    same shape as the input so Brooklyn row-house-blocks stay faithful."""
+    from affine import Affine
+
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "0.01")
+
+    multi = {
+        "type": "Feature",
+        "properties": {"source_gdb": "Kings_Building_Footprints.gdb"},
+        "geometry": {
+            "type": "MultiPolygon",
+            "coordinates": [
+                [[[1, 1], [4, 1], [4, 4], [1, 4], [1, 1]]],
+                [[[7, 7], [10, 7], [10, 10], [7, 10], [7, 7]]],
+            ],
+        },
+    }
+    _write_baseline_geojson(tmp_path, [multi])
+
+    base = np.zeros((15, 15), dtype=np.uint8)
+    base[1:4, 1:4] = 1
+    base[7:10, 7:10] = 1
+    img = base.copy()
+
+    payload, summary, _ = _run_stage(
+        tmp_path, mask=img, baseline_mask=base,
+        transform=Affine.identity(), crs="EPSG:3857",
+    )
+    # One GDB row = one change event, regardless of how many polygons the
+    # MultiPolygon source has. Two Polygon features are emitted for UI
+    # convenience (most map libraries handle Polygon better than
+    # MultiPolygon), but both carry the same classification + source_gdb.
+    assert len(payload["features"]) == 2
+    assert summary.qa["change_counts"]["unchanged"] == 1
+    assert all(
+        f["properties"]["change_type"] == "unchanged"
+        for f in payload["features"]
+    )
+    assert all(
+        f["properties"].get("source_gdb") == "Kings_Building_Footprints.gdb"
+        for f in payload["features"]
+    )
+
+
+def test_per_source_feature_requires_transform(tmp_path: Path, monkeypatch) -> None:
+    """If the caller didn't supply a transform/CRS (pure-pixel-space tests),
+    the per-source path is skipped (rasterize needs a transform) and we fall
+    back to component-labeling."""
+    _write_baseline_geojson(tmp_path, [
+        {
+            "type": "Feature", "properties": {},
+            "geometry": {"type": "Polygon",
+                         "coordinates": [[[2, 2], [8, 2], [8, 8], [2, 8], [2, 2]]]},
+        }
+    ])
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+
+    base = np.zeros((20, 20), dtype=np.uint8)
+    img = np.zeros((20, 20), dtype=np.uint8)
+    base[2:8, 2:8] = 1
+    img[2:8, 2:8] = 1
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    # No transform -> pixel_space_only -> component-labeled fallback.
+    assert summary.qa["change_source"] == "component_labeled"

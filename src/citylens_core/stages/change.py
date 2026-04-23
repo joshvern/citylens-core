@@ -8,19 +8,65 @@ from typing import Any
 from ..models import CitylensRequest, PipelineSummary
 
 
-def _min_component_area_px() -> int:
-    """Connected components below this pixel area are dropped as noise.
+# ----------------------------------------------------------------------
+# Tunable thresholds (env-var overridable at deploy time).
+# ----------------------------------------------------------------------
 
-    Tunable via CITYLENS_CHANGE_MIN_AREA_PX. Default 8 — kills single-pixel
-    artifacts from morphology/thresholding without swallowing small buildings
-    at 1024x1024 resolution (a 5x5 building is still 25 px).
-    """
-    raw = os.getenv("CITYLENS_CHANGE_MIN_AREA_PX", "").strip()
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
     try:
-        value = int(raw) if raw else 8
+        value = float(raw)
     except ValueError:
-        return 8
+        return default
+    if value < 0:
+        return default
+    return value
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
     return max(0, value)
+
+
+def _min_area_m2() -> float:
+    """Drop change features smaller than this area in square meters.
+
+    Default 100 m² (roughly one small garage/shed). Kills the sliver-noise
+    from imperfect mask alignment at building edges.
+    """
+    return _float_env("CITYLENS_CHANGE_MIN_AREA_M2", 100.0)
+
+
+def _unchanged_iou() -> float:
+    return _float_env("CITYLENS_CHANGE_UNCHANGED_IOU", 0.6)
+
+
+def _modified_iou() -> float:
+    return _float_env("CITYLENS_CHANGE_MODIFIED_IOU", 0.2)
+
+
+def _added_max_baseline_overlap() -> float:
+    """A new component counts as 'added' only if it overlaps ANY baseline
+    footprint by less than this fraction of its own area. Catches the case
+    where SAM2 traces a building wider than the baseline footprint and
+    leaves a sliver along the edge — that sliver should NOT be flagged as
+    a new building.
+    """
+    return _float_env("CITYLENS_CHANGE_ADDED_MAX_BASELINE_OVERLAP", 0.1)
+
+
+# ----------------------------------------------------------------------
+# Geometry helpers
+# ----------------------------------------------------------------------
 
 
 def _affine_identity():
@@ -29,97 +75,125 @@ def _affine_identity():
     return Affine.identity()
 
 
-def _polygonize_mask(
-    mask: Any,
-    *,
-    transform: Any | None,
-    min_area_px: int | None = None,
-) -> list[list[list[list[float]]]]:
-    """Trace a boolean mask into one ring-list per connected component.
+def _label_components(mask: Any) -> tuple[Any, int]:
+    """Return (labels, n) — labels[i,j]==k for cells in component k (1..n).
 
-    Returns a list of Polygon `coordinates` values (each is a list of rings).
-    The outer ring comes first, followed by interior holes (if any).
-    Coordinates are in (x, y) — either pixel space (if transform is None)
-    or projected world units (if transform is provided).
+    Uses rasterio.features.shapes which is already in the core dep tree.
+    Same helper as sam2_runner but inlined here to keep the change stage
+    dependency graph tight.
+    """
+    import numpy as np
+    from rasterio.features import rasterize, shapes
+    from rasterio.transform import Affine
+
+    m = np.asarray(mask).astype(bool)
+    h, w = m.shape
+    labels = np.zeros((h, w), dtype=np.int64)
+    if not m.any():
+        return labels, 0
+
+    m_u8 = m.astype("uint8")
+    n = 0
+    identity = Affine.identity()
+    for geom, value in shapes(m_u8, mask=m, transform=identity):
+        if int(value) != 1:
+            continue
+        n += 1
+        comp_mask = rasterize(
+            shapes=[(geom, 1)],
+            out_shape=(h, w),
+            transform=identity,
+            fill=0,
+            default_value=1,
+            all_touched=False,
+            dtype="uint8",
+        ).astype(bool)
+        comp_mask &= m
+        labels[comp_mask] = n
+    return labels, n
+
+
+def _polygon_coords_from_pixel_mask(
+    pixel_mask: Any, *, transform: Any | None
+) -> list[list[list[list[float]]]]:
+    """Trace a boolean mask into a list of GeoJSON Polygon coordinates
+    (each item is [outer_ring, hole_1, ...]).
     """
     import numpy as np
     from rasterio.features import shapes
 
-    m = np.asarray(mask).astype(bool)
-    if m.size == 0 or not m.any():
+    m = np.asarray(pixel_mask).astype(bool)
+    if not m.any():
         return []
 
-    if min_area_px is None:
-        min_area_px = _min_component_area_px()
-
-    # `shapes` needs a transform; if none given, use identity so we stay in
-    # pixel coordinates.
     tr = transform if transform is not None else _affine_identity()
-
-    polygons: list[list[list[list[float]]]] = []
-    m_uint8 = m.astype("uint8")
-    for geom, value in shapes(m_uint8, mask=m, transform=tr):
+    polys: list[list[list[list[float]]]] = []
+    m_u8 = m.astype("uint8")
+    for geom, value in shapes(m_u8, mask=m, transform=tr):
         if int(value) != 1:
             continue
-        if geom.get("type") != "Polygon":
+        coords = geom.get("coordinates") or []
+        if not coords:
             continue
-        coordinates = geom.get("coordinates") or []
-        if not coordinates:
-            continue
-
-        # Filter tiny specks by computing the polygon's pixel area.
-        # In pixel space this is trivial; in world space we compute the ring
-        # area analytically (shoelace) and bail if it's below the threshold
-        # scaled by pixel size.
-        outer = coordinates[0]
-        try:
-            area_world = abs(
-                sum(
-                    (outer[i][0] + outer[i + 1][0])
-                    * (outer[i + 1][1] - outer[i][1])
-                    for i in range(len(outer) - 1)
-                )
-                / 2.0
-            )
-        except Exception:
-            area_world = 0.0
-
-        if transform is None:
-            if area_world < float(min_area_px):
-                continue
-        else:
-            # Transform.a is x-pixel size, transform.e is y-pixel size (usually negative).
-            try:
-                px_area = abs(float(transform.a) * float(transform.e))
-            except Exception:
-                px_area = 1.0
-            min_world_area = max(px_area, 1e-9) * float(min_area_px)
-            if area_world < min_world_area:
-                continue
-
-        polygons.append([list(ring) for ring in coordinates])
-
-    return polygons
+        polys.append([list(ring) for ring in coords])
+    return polys
 
 
-def _build_feature(
+def _pixel_area_m2(transform: Any | None, crs_value: str | None) -> float:
+    """Return the area of one pixel in square meters, or 0 when we can't
+    confidently convert (e.g. pixel-space only or unknown CRS)."""
+    if transform is None:
+        return 0.0
+    try:
+        # Affine.a is x pixel size; Affine.e is y pixel size (usually negative).
+        px = abs(float(transform.a) * float(transform.e))
+    except Exception:
+        return 0.0
+    if not px:
+        return 0.0
+    s = (crs_value or "").strip().lower()
+    # EPSG:3857 has units of meters but scale varies with latitude
+    # (the pixel width stored in `a` is already in the projected meters
+    # used by rasterio, so px is already m²). For projected CRS in feet,
+    # convert.
+    if s in ("pixel", ""):
+        return 0.0
+    if "ftus" in s or "ft" in s.replace("-", "").replace("_", "") and "meter" not in s:
+        # 1 US survey foot = 0.3048006096... m, so 1 ft² ≈ 0.09290341 m²
+        return px * 0.0929034116
+    return px
+
+
+def _feature(
     *,
-    kind: str,
+    change_type: str,
     coordinates: list[list[list[float]]],
+    area_m2: float | None,
+    baseline_iou: float | None,
     imagery_year: int,
     baseline_year: int,
     crs_value: str,
 ) -> dict[str, Any]:
+    props: dict[str, Any] = {
+        "change_type": change_type,
+        "imagery_year": imagery_year,
+        "baseline_year": baseline_year,
+        "crs": crs_value,
+    }
+    if baseline_iou is not None:
+        props["baseline_iou"] = round(float(baseline_iou), 4)
+    if area_m2 is not None:
+        props["area_m2"] = round(float(area_m2), 1)
     return {
         "type": "Feature",
-        "properties": {
-            "kind": kind,
-            "imagery_year": imagery_year,
-            "baseline_year": baseline_year,
-            "crs": crs_value,
-        },
+        "properties": props,
         "geometry": {"type": "Polygon", "coordinates": coordinates},
     }
+
+
+# ----------------------------------------------------------------------
+# Main stage
+# ----------------------------------------------------------------------
 
 
 def stage_change(
@@ -128,6 +202,19 @@ def stage_change(
     ctx: dict[str, Any],
     summary: PipelineSummary,
 ) -> dict[str, Any]:
+    """Per-baseline-building change classification.
+
+    Produces one GeoJSON Feature per building event:
+      - unchanged   — baseline footprint well-covered by current mask (IoU >= 0.6)
+      - modified    — baseline footprint partially covered (0.2 <= IoU < 0.6)
+      - demolished  — baseline footprint no longer present (IoU < 0.2)
+      - added       — current-year structure that doesn't overlap any baseline
+
+    Replaces the old per-connected-component XOR-polygon output that
+    emitted hundreds of edge-slivers per run.
+    """
+    import numpy as np
+
     out_path = work_dir / "change.geojson"
 
     imagery_mask = ctx.get("refined_mask", ctx.get("mask"))
@@ -140,27 +227,118 @@ def stage_change(
     transform = ctx.get("orthophoto_transform")
     crs = ctx.get("orthophoto_crs")
     if crs is None or transform is None:
-        transform = None
+        # Pixel-space only: we can still classify, but area-based filters
+        # are measured in pixels rather than m².
+        pixel_space_only = True
         crs_value = "pixel"
     else:
+        pixel_space_only = False
         crs_value = str(crs)
-
-    import numpy as np
 
     im = np.asarray(imagery_mask).astype(bool)
     base = np.asarray(baseline_mask).astype(bool)
-    added = np.logical_and(im, np.logical_not(base))
-    removed = np.logical_and(base, np.logical_not(im))
-    change_mask = np.logical_or(added, removed)
+
+    min_area_m2 = _min_area_m2()
+    unchanged_thresh = _unchanged_iou()
+    modified_thresh = _modified_iou()
+    added_overlap_cap = _added_max_baseline_overlap()
+    px_area_m2 = _pixel_area_m2(transform, crs_value)
+    # When no CRS info is available, fall back to a pixel-count threshold
+    # that's comparable across tests.
+    min_area_px = (
+        int(round(min_area_m2 / px_area_m2)) if px_area_m2 > 0 else _int_env("CITYLENS_CHANGE_MIN_AREA_PX", 40)
+    )
 
     features: list[dict[str, Any]] = []
-    for kind, m in ("added", added), ("removed", removed):
-        polygons = _polygonize_mask(m, transform=transform)
-        for coordinates in polygons:
+    counts = {"unchanged": 0, "modified": 0, "demolished": 0, "added": 0}
+
+    # ------------------------------------------------------------------
+    # 1. Classify each baseline footprint
+    # ------------------------------------------------------------------
+    baseline_labels, baseline_n = _label_components(base)
+    for comp_id in range(1, baseline_n + 1):
+        comp = baseline_labels == comp_id
+        comp_area_px = int(comp.sum())
+        if comp_area_px < 1:
+            continue
+
+        # IoU between this baseline footprint and the SAM2 mask, measured
+        # inside the bounding box of the footprint. This avoids a single
+        # giant current-mask swallowing many small baseline footprints.
+        ys, xs = np.where(comp)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        # Dilate the bbox slightly (10%) so a building that shifted by a
+        # few pixels still gets counted as the same feature.
+        pad_y = max(1, (y1 - y0) // 10)
+        pad_x = max(1, (x1 - x0) // 10)
+        y0 = max(0, y0 - pad_y)
+        x0 = max(0, x0 - pad_x)
+        y1 = min(comp.shape[0], y1 + pad_y)
+        x1 = min(comp.shape[1], x1 + pad_x)
+
+        comp_roi = comp[y0:y1, x0:x1]
+        im_roi = im[y0:y1, x0:x1]
+        inter = int(np.logical_and(comp_roi, im_roi).sum())
+        union = int(np.logical_or(comp_roi, im_roi).sum())
+        iou = float(inter) / float(union) if union > 0 else 0.0
+
+        if iou >= unchanged_thresh:
+            change_type = "unchanged"
+        elif iou >= modified_thresh:
+            change_type = "modified"
+        else:
+            change_type = "demolished"
+        counts[change_type] += 1
+
+        area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
+        polys = _polygon_coords_from_pixel_mask(comp, transform=transform)
+        for coordinates in polys:
             features.append(
-                _build_feature(
-                    kind=kind,
+                _feature(
+                    change_type=change_type,
                     coordinates=coordinates,
+                    area_m2=area_m2_val,
+                    baseline_iou=iou,
+                    imagery_year=request.imagery_year,
+                    baseline_year=request.baseline_year,
+                    crs_value=crs_value,
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # 2. Find "added" buildings — components in imagery that don't overlap
+    #    any baseline footprint.
+    # ------------------------------------------------------------------
+    added_pixels = np.logical_and(im, np.logical_not(base))
+    added_labels, added_n = _label_components(added_pixels)
+    for comp_id in range(1, added_n + 1):
+        comp = added_labels == comp_id
+        comp_area_px = int(comp.sum())
+        if comp_area_px < min_area_px:
+            continue
+
+        # Reject slivers along existing baseline buildings: if more than
+        # `added_overlap_cap` of this component's area touches the dilated
+        # baseline (i.e. the SAM2 blob that overlaps an existing building
+        # leaked past the footprint boundary), don't treat it as new.
+        # Cheap proxy: any pixel in `comp` that neighbors a `base` pixel
+        # is counted as "touching".
+        overlap_touching = int(np.logical_and(comp, _one_step_dilate(base)).sum())
+        overlap_fraction = float(overlap_touching) / float(comp_area_px) if comp_area_px else 1.0
+        if overlap_fraction > added_overlap_cap:
+            continue
+
+        counts["added"] += 1
+        area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
+        polys = _polygon_coords_from_pixel_mask(comp, transform=transform)
+        for coordinates in polys:
+            features.append(
+                _feature(
+                    change_type="added",
+                    coordinates=coordinates,
+                    area_m2=area_m2_val,
+                    baseline_iou=None,
                     imagery_year=request.imagery_year,
                     baseline_year=request.baseline_year,
                     crs_value=crs_value,
@@ -169,4 +347,29 @@ def stage_change(
 
     feature_collection = {"type": "FeatureCollection", "features": features}
     out_path.write_text(json.dumps(feature_collection, indent=2))
-    return {**ctx, "change_path": out_path, "change_mask": change_mask.astype(np.uint8)}
+
+    # Surface breakdown on summary.qa so operators can eyeball noise levels
+    # without parsing the geojson.
+    summary.qa["change_counts"] = dict(counts)
+
+    change_mask = np.logical_or(
+        np.logical_and(im, np.logical_not(base)),
+        np.logical_and(base, np.logical_not(im)),
+    ).astype(np.uint8)
+    return {**ctx, "change_path": out_path, "change_mask": change_mask}
+
+
+def _one_step_dilate(mask):
+    """Tiny 3x3 dilation: used to detect 'component touches baseline' for
+    the added-sliver filter. Pure numpy; avoids scipy/skimage."""
+    import numpy as np
+
+    m = np.asarray(mask).astype(bool)
+    if not m.any():
+        return m
+    padded = np.pad(m, 1, mode="constant", constant_values=False)
+    out = np.zeros_like(m)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            out |= padded[dy : dy + m.shape[0], dx : dx + m.shape[1]]
+    return out

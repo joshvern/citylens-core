@@ -219,3 +219,67 @@ def test_reconstruct_uses_lidar_when_available(tmp_path: Path, monkeypatch) -> N
     assert "20.0" in mesh_text
     assert "30.0" in mesh_text
     assert "40.0" in mesh_text
+
+
+def test_reconstruct_lod1_emits_per_building_extrusions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.reconstruct import stage_reconstruct
+
+    req = CitylensRequest(address="x", segmentation_backend="sam2")
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc)
+    )
+
+    change_path = tmp_path / "change.geojson"
+    change_path.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"change_type": "unchanged"},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [[0, 0], [4, 0], [4, 4], [0, 4], [0, 0]]
+                            ],
+                        },
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {"change_type": "demolished"},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [[5, 5], [9, 5], [9, 9], [5, 9], [5, 5]]
+                            ],
+                        },
+                    },
+                ],
+            }
+        )
+    )
+
+    heights = np.full((10, 10), np.nan, dtype=np.float32)
+    heights[0:4, 0:4] = 25.0
+
+    ctx = {
+        "mask": np.ones((10, 10), dtype=np.uint8),
+        "orthophoto_transform": Affine.identity(),
+        "lidar_heights": heights,
+        "lidar_ground_z": 0.0,
+        "change_path": change_path,
+    }
+
+    out = stage_reconstruct(req, tmp_path, ctx, summary)
+    mesh_text = (tmp_path / "mesh.ply").read_text()
+
+    assert out["mesh_path"] == tmp_path / "mesh.ply"
+    assert summary.qa["mesh_source"] == "lod1"
+    assert summary.qa["mesh_buildings"] == 1  # demolished skipped
+    assert summary.qa["mesh_stats"]["skipped_demolished"] == 1
+    # The roof samples at 25 m should round-trip through the PLY text.
+    assert "25.0" in mesh_text

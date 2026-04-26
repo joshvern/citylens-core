@@ -40,6 +40,83 @@ def _slugify_reference_case(text: str) -> str:
     return slug.strip("_") or "unknown_case"
 
 
+def _reproject_change_geojson_to_wgs84(
+    change_path: Path | None,
+    src_crs: str | None,
+    summary: PipelineSummary,
+) -> None:
+    """Rewrite change.geojson in WGS84 (EPSG:4326) so it renders on
+    standard web maps. Originating CRS is preserved per-feature in
+    properties.source_crs.
+
+    No-op when:
+    - the file doesn't exist (change wasn't requested),
+    - src_crs is missing or "pixel" (we never had real geo coords),
+    - src_crs is already WGS84.
+    """
+    if change_path is None or not change_path.exists():
+        return
+    if not src_crs:
+        return
+    src_norm = str(src_crs).strip()
+    if not src_norm or src_norm.lower() == "pixel":
+        return
+    if src_norm.upper() in ("EPSG:4326", "WGS84", "OGC:CRS84"):
+        return
+
+    try:
+        from pyproj import Transformer
+    except Exception as e:
+        summary.warn(f"reproject_change_geojson: pyproj unavailable ({e})")
+        return
+
+    try:
+        transformer = Transformer.from_crs(src_norm, "EPSG:4326", always_xy=True)
+    except Exception as e:
+        summary.warn(f"reproject_change_geojson: bad src_crs={src_norm} ({e})")
+        return
+
+    def _ring(coords: list) -> list:
+        out = []
+        for pt in coords:
+            if not pt or len(pt) < 2:
+                continue
+            lon, lat = transformer.transform(float(pt[0]), float(pt[1]))
+            out.append([lon, lat])
+        return out
+
+    def _geom(geom: dict[str, Any]) -> dict[str, Any]:
+        t = geom.get("type")
+        coords = geom.get("coordinates") or []
+        if t == "Polygon":
+            return {"type": "Polygon", "coordinates": [_ring(r) for r in coords]}
+        if t == "MultiPolygon":
+            return {
+                "type": "MultiPolygon",
+                "coordinates": [[_ring(r) for r in poly] for poly in coords],
+            }
+        return geom
+
+    try:
+        payload = json.loads(change_path.read_text())
+    except Exception as e:
+        summary.warn(f"reproject_change_geojson: read failed ({e})")
+        return
+
+    features = payload.get("features") or []
+    for feat in features:
+        geom = feat.get("geometry")
+        if isinstance(geom, dict):
+            feat["geometry"] = _geom(geom)
+        props = feat.get("properties") or {}
+        if "crs" in props and props["crs"] != "EPSG:4326":
+            props["source_crs"] = props["crs"]
+            props["crs"] = "EPSG:4326"
+        feat["properties"] = props
+
+    change_path.write_text(json.dumps(payload, indent=2))
+
+
 def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -> dict[str, Path]:
     """Orchestrate the Citylens pipeline.
 
@@ -300,6 +377,15 @@ def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -
     duration_s = max(0.0, float(time.time() - t0))
     summary.performance["total_runtime_seconds"] = duration_s
     _populate_quality_metrics(ctx)
+    # GeoJSON RFC 7946 requires WGS84 lng/lat. We write change.geojson in
+    # the ortho's CRS so QA can rasterize against orthophoto_transform
+    # without re-projection; here we rewrite it in WGS84 so Leaflet/
+    # MapboxGL etc. render the polygons on a real map.
+    _reproject_change_geojson_to_wgs84(
+        standard_paths.get("change"),
+        ctx.get("orthophoto_crs"),
+        summary,
+    )
     write_run_summary(summary, standard_paths["summary"], extra={"duration_s": duration_s})
 
     for key, path in standard_paths.items():

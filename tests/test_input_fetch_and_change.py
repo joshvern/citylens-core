@@ -370,3 +370,97 @@ def test_render_change_aware_preview(tmp_path: Path) -> None:
     # Red-dominant pixels (demolished) should exist in the demolished region.
     demo_region = pixels[82:98, 132:148]
     assert (demo_region[..., 0] > demo_region[..., 1]).any()
+
+
+def test_change_geojson_is_reprojected_to_wgs84(tmp_path: Path) -> None:
+    """Pipeline post-step rewrites change.geojson from the ortho CRS to
+    WGS84 lng/lat so Leaflet renders the polygons.
+    """
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.pipeline import _reproject_change_geojson_to_wgs84
+
+    req = CitylensRequest(address="x", segmentation_backend="sam2")
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc)
+    )
+
+    # NYC-ish point in EPSG:3857 (Web Mercator meters); should reproject
+    # to ~(-73.95, 40.65) in WGS84 lng/lat.
+    change_path = tmp_path / "change.geojson"
+    change_path.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "change_type": "added",
+                            "crs": "EPSG:3857",
+                        },
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [
+                                    [-8233100, 4961100],
+                                    [-8233000, 4961100],
+                                    [-8233000, 4961200],
+                                    [-8233100, 4961200],
+                                    [-8233100, 4961100],
+                                ]
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    _reproject_change_geojson_to_wgs84(change_path, "EPSG:3857", summary)
+
+    payload = json.loads(change_path.read_text())
+    feat = payload["features"][0]
+    coords = feat["geometry"]["coordinates"][0]
+    lons = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+    # Brooklyn-area lng/lat band
+    assert all(-74.1 < lon < -73.8 for lon in lons), lons
+    assert all(40.5 < lat < 40.8 for lat in lats), lats
+    # Original CRS is preserved on the feature for traceability
+    assert feat["properties"]["crs"] == "EPSG:4326"
+    assert feat["properties"]["source_crs"] == "EPSG:3857"
+
+
+def test_reproject_change_geojson_noop_for_pixel_or_wgs84(tmp_path: Path) -> None:
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.pipeline import _reproject_change_geojson_to_wgs84
+
+    req = CitylensRequest(address="x", segmentation_backend="sam2")
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc)
+    )
+
+    payload = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"change_type": "added", "crs": "pixel"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]],
+                },
+            }
+        ],
+    }
+    p = tmp_path / "change.geojson"
+    p.write_text(json.dumps(payload))
+
+    # pixel src_crs => no-op
+    _reproject_change_geojson_to_wgs84(p, "pixel", summary)
+    assert json.loads(p.read_text())["features"][0]["geometry"]["coordinates"][0][1] == [10, 0]
+
+    # already-WGS84 src_crs => no-op (still won't double-translate)
+    p.write_text(json.dumps(payload))
+    _reproject_change_geojson_to_wgs84(p, "EPSG:4326", summary)
+    assert json.loads(p.read_text())["features"][0]["geometry"]["coordinates"][0][1] == [10, 0]

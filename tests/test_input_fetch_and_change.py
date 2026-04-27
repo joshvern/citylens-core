@@ -283,6 +283,11 @@ def test_reconstruct_lod1_emits_per_building_extrusions(
     assert summary.qa["mesh_stats"]["skipped_demolished"] == 1
     # The roof samples at 25 m should round-trip through the PLY text.
     assert "25.0" in mesh_text
+    # mesh_footprint_mask must be the union of polygons we actually extruded —
+    # not the full grid (which would include streets/cars/trees) and not empty.
+    fp = out["mesh_footprint_mask"]
+    assert fp.sum() > 0
+    assert fp.sum() < heights.size
 
 
 def test_render_change_aware_preview(tmp_path: Path) -> None:

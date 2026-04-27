@@ -118,7 +118,12 @@ def _build_lod1_mesh(
     transform: Any,
     lidar_heights: Any,
     ground_z: float,
-) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]], dict[str, int]]:
+) -> tuple[
+    list[tuple[float, float, float]],
+    list[tuple[int, int, int]],
+    Any,
+    dict[str, int],
+]:
     import numpy as np
     from rasterio.features import rasterize
 
@@ -128,6 +133,11 @@ def _build_lod1_mesh(
 
     vertices: list[tuple[float, float, float]] = []
     faces: list[tuple[int, int, int]] = []
+    # Union of every polygon we actually extruded into the mesh — this is what
+    # the QA stage IoUs against the SAM2 building mask. Demolished/skipped
+    # features are intentionally excluded so the union reflects the mesh
+    # geometry, not the input footprints.
+    footprint_mask = np.zeros((H, W), dtype=bool)
     stats = {"count": 0, "skipped_empty": 0, "default_height": 0, "skipped_demolished": 0}
 
     for feat in features:
@@ -170,9 +180,10 @@ def _build_lod1_mesh(
             continue
         for ring_px in rings_px:
             _extrude_ring(ring_px, float(ground_z), roof_z, vertices, faces)
+        footprint_mask |= mask
         stats["count"] += 1
 
-    return vertices, faces, stats
+    return vertices, faces, footprint_mask, stats
 
 
 def _write_ply_ascii(
@@ -276,21 +287,18 @@ def stage_reconstruct(
     ):
         features = _load_change_features(Path(change_path))
         if features:
-            vertices, faces, stats = _build_lod1_mesh(
+            vertices, faces, footprint_mask, stats = _build_lod1_mesh(
                 features, transform, lidar_heights, float(lidar_ground_z)
             )
             if vertices and faces:
                 _write_ply_ascii(out_path, vertices, faces)
-                import numpy as np
-
-                footprint_mask = (np.asarray(lidar_heights) > -1e18).astype("uint8")
                 summary.qa["mesh_source"] = "lod1"
                 summary.qa["mesh_buildings"] = stats["count"]
                 summary.qa["mesh_stats"] = dict(stats)
                 return {
                     **ctx,
                     "mesh_path": out_path,
-                    "mesh_footprint_mask": footprint_mask,
+                    "mesh_footprint_mask": footprint_mask.astype("uint8"),
                     "mesh_height_source": "lidar",
                 }
 

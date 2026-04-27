@@ -75,6 +75,50 @@ Option X at 0.4 gives the cleanest numbers (42/1/0/25) but moves the bar too far
 
 Expected steady-state behavior on a stable block: ~70% `unchanged`, ~25% `modified`, 0–5% `demolished`, plus a separate `added` tail from SAM2 false positives not suppressed by the overlap filter.
 
+## Update — 2026-04-27 — recalibrated for 250m AOI (169 buildings)
+
+After fixing `request.aoi_radius_m` to be honored end-to-end (engine PR #20), the
+Brooklyn reference run now classifies 169 baseline footprints (was 53). The 0.5
+threshold flagged 74/169 (44%) as `modified` on a block where almost nothing
+visibly changed 2017→2024 — clearly too aggressive. Re-measured the IoU
+distribution from this larger sample:
+
+```
+IoU bin    count  bar (1 # = 1 bldg)
+[0.0-0.1):     3  ###
+[0.1-0.2):     0
+[0.2-0.3):     6  ######
+[0.3-0.4):    22  ######################
+[0.4-0.5):    46  ##############################################
+[0.5-0.6):    33  #################################
+[0.6-0.7):    42  ##########################################
+[0.7-0.8):    14  ##############
+[0.8-0.9):     2  ##
+[0.9-1.0):     1  #
+```
+
+The distribution is **bimodal**: a thin "demolished" tail near 0, and a fat
+"unchanged" hump from 0.3 to 0.9 with a double peak at 0.4–0.5 and 0.6–0.7
+(the second peak is large simple roofs SAM2 traces cleanly; the first is small
+or complex roofs). The 0.4–0.5 bucket is mostly stable buildings whose IoU is
+suppressed by overhang/edge structural mismatch, **not** real modification.
+
+Reclassification sweep (modified_iou pinned at 0.2):
+
+| `unchanged_iou` | unchanged | modified | demolished |
+|---|---|---|---|
+| 0.30 | 160 | 6 | 3 |
+| 0.35 | 152 | 14 | 3 |
+| **0.40** | **138** | **28** | **3** |
+| 0.45 | 116 | 50 | 3 |
+| 0.50 | 92 | 74 | 3 |
+
+**New default: `CITYLENS_CHANGE_UNCHANGED_IOU=0.40`.** Result: 82% unchanged,
+17% modified, 2% demolished, 2% added — matches what a human reviewer would
+flag on a stable block. The previous 0.5 default was honest for the older 53-
+building sample but didn't generalize once we expanded to 169 buildings with
+more small/complex roofs in the periphery.
+
 ## Out-of-scope questions this surfaced
 
 1. **`added = 25` is still too many.** The overlap filter rejects additions that touch any baseline footprint, but SAM2 still finds 25 building-shaped things that AREN'T in the 2017 GDB. Probably some mix of (a) real post-2017 construction, (b) garages / backyard structures that NYC OpenData doesn't track, (c) adjacent-building merges leaking past the baseline. Separate investigation.

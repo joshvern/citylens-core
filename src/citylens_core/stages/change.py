@@ -47,13 +47,14 @@ def _min_area_m2() -> float:
 
 
 def _unchanged_iou() -> float:
-    # Calibrated against real Brooklyn data (see research/change_threshold_calibration.md):
-    # SAM2's IoU distribution vs NYC GDB footprints is unimodal, peaked at
-    # 0.5. That's not noise — it's a structural mismatch (roof edges vs
-    # ground-level footprints at ~1m resolution). 0.6 was too strict and
-    # swept real "unchanged" buildings into a "modified" bucket they didn't
-    # belong in. 0.5 matches the distribution.
-    return _float_env("CITYLENS_CHANGE_UNCHANGED_IOU", 0.5)
+    # Recalibrated against the wider 250m AOI Brooklyn block (169 buildings,
+    # see research/change_threshold_calibration.md). The IoU distribution is
+    # bimodal with a stable-block peak around 0.40-0.70 and a thin demolished
+    # tail near 0. At threshold 0.50 we got 44% "modified" on a block where
+    # almost nothing changed 2017→2024 — that's structural SAM2-vs-GDB edge
+    # noise, not real modification. At 0.40 we get ~17% modified, which
+    # matches what a human reviewer would flag.
+    return _float_env("CITYLENS_CHANGE_UNCHANGED_IOU", 0.4)
 
 
 def _modified_iou() -> float:

@@ -446,8 +446,127 @@ def test_lidar_height_gate_skipped_when_lidar_absent(
     payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
     assert summary.qa["change_counts"]["added"] == 1
     assert summary.qa["added_rejected"] == {
-        "too_small": 0, "baseline_overlap": 0, "too_short": 0,
+        "too_small": 0,
+        "baseline_overlap": 0,
+        "centroid_near_baseline": 0,
+        "too_short": 0,
     }
+
+
+def test_demolished_is_rescued_to_modified_when_lidar_shows_a_standing_building(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """SAM2 sometimes misses a building entirely (dark roof on shadowed
+    imagery → IoU≈0) and the naive rule wrongly labels it demolished. If
+    LiDAR shows a real structure standing inside the baseline footprint,
+    downgrade demolished→modified — the SAM2 mask is unreliable but LiDAR
+    confirms the building is still there."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_DEMOLISHED_MAX_HEIGHT_M", "3.0")
+
+    base = np.zeros((20, 20), dtype=np.uint8)
+    img = np.zeros((20, 20), dtype=np.uint8)
+    base[2:12, 2:12] = 1
+    # SAM2 mask is empty inside the footprint → IoU = 0 → naive demolished.
+
+    # LiDAR says the building is still there: 15 m above a 0 m ground
+    # plane is a clear five-story building.
+    heights = np.full((20, 20), 15.0, dtype=np.float32)
+    ground = 0.0
+
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.change import stage_change
+
+    req = CitylensRequest(
+        address="x", segmentation_backend="sam2",
+        imagery_year=2024, baseline_year=2017,
+    )
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc),
+    )
+    ctx = {
+        "mask": img, "baseline_mask": base,
+        "lidar_heights": heights, "lidar_ground_z": ground,
+    }
+    stage_change(req, tmp_path, ctx, summary)
+    payload = json.loads((tmp_path / "change.geojson").read_text())
+    kinds = [f["properties"]["change_type"] for f in payload["features"]]
+    assert kinds == ["modified"], f"expected rescue → modified, got {kinds}"
+    assert summary.qa["change_counts"]["demolished"] == 0
+    assert summary.qa["change_counts"]["modified"] == 1
+    assert summary.qa["demolished_downgraded_to_modified"] == 1
+
+
+def test_demolished_rescue_does_not_fire_without_lidar(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No LiDAR on ctx → rescue can't run, so a SAM2-empty baseline footprint
+    still classifies as demolished (legacy behavior)."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+
+    base = np.zeros((20, 20), dtype=np.uint8)
+    img = np.zeros((20, 20), dtype=np.uint8)
+    base[2:12, 2:12] = 1
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    assert summary.qa["change_counts"]["demolished"] == 1
+    assert summary.qa["demolished_downgraded_to_modified"] == 0
+
+
+def test_added_courtyard_rejected_by_baseline_dilation_centroid_filter(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """SAM2 picks up courtyards / lightwells (flat roof-like surfaces between
+    buildings) as 'added' candidates. The 1-px overlap filter doesn't catch
+    them because there's a 2-10 px gap from surrounding buildings (rasterized
+    GDB footprints + sidewalk moat). The wider centroid-near-baseline filter
+    rejects any candidate whose centroid lies inside the 8-px-dilated
+    baseline mask."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", "8")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    img = np.zeros((40, 40), dtype=np.uint8)
+    # Two baseline buildings with a 12-px-wide moat between them — the
+    # GDB rasterizer + sidewalk gap produces this kind of spacing. The
+    # courtyard candidate sits in the middle of that gap, ~4 px from the
+    # nearest baseline edge. That's far enough that the 1-px overlap
+    # filter does NOT catch it, but well inside the 8-px-dilated baseline
+    # mask, so the centroid-near-baseline filter must reject it.
+    base[10:30, 4:14] = 1   # left wing
+    base[10:30, 26:36] = 1  # right wing
+    # SAM2 traced the courtyard surface as a building, sitting in the
+    # middle of the gap (4 px clearance from both baseline edges).
+    img[14:26, 18:22] = 1
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    # Confirm the 1-px overlap filter did NOT catch this — only the new
+    # centroid-near-baseline filter did.
+    assert summary.qa["added_rejected"]["baseline_overlap"] == 0
+    assert summary.qa["change_counts"]["added"] == 0
+    assert summary.qa["added_rejected"]["centroid_near_baseline"] == 1
+
+
+def test_added_genuine_new_building_far_from_baseline_passes_centroid_filter(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Sanity check: an 'added' candidate whose centroid is well outside the
+    8-px-dilated baseline mask is NOT rejected by the courtyard filter."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", "8")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    img = np.zeros((40, 40), dtype=np.uint8)
+    # Baseline footprint in upper-left.
+    base[2:8, 2:8] = 1
+    img[2:8, 2:8] = 1
+    # Genuine new building far away in the lower-right (centroid ~(30, 30)
+    # is more than 8 px from any baseline pixel).
+    img[27:33, 27:33] = 1
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    assert summary.qa["change_counts"]["added"] == 1
+    assert summary.qa["added_rejected"]["centroid_near_baseline"] == 0
 
 
 def test_lidar_height_gate_rejects_when_component_has_no_lidar_coverage(

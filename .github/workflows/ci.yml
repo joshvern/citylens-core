@@ -3,6 +3,9 @@ name: ci
 on:
   push:
     branches:
+      # Default branch is `master`; `main` is listed too so this still works
+      # if the repo is renamed later. PRs already trigger via `pull_request:`.
+      - master
       - main
   pull_request:
 

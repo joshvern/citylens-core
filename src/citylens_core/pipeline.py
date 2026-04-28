@@ -11,7 +11,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 from .io.artifacts import compute_artifact_metadata, write_run_summary
-from .io.geo import load_geojson_mask, mask_f1, mask_iou
+from .io.geo import mask_f1, mask_iou
 from .models import CitylensRequest, PipelineSummary
 from .stages.change import stage_change
 from .stages.fetch import stage_fetch

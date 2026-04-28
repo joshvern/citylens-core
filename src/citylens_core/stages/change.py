@@ -446,10 +446,8 @@ def stage_change(
     # didn't materialize the geojson (unit tests, non-NYC paths), fall back
     # to component-labeling the rasterized baseline mask.
     source_features = _load_baseline_source_features(work_dir)
-    used_per_source = False
 
     if source_features is not None and not pixel_space_only:
-        used_per_source = True
         summary.qa["change_source"] = "per_source_feature"
         h, w = im.shape
         for src_feat in source_features:

@@ -340,7 +340,7 @@ def test_lod1_mesh_has_per_change_type_vertex_colors(
         "change_path": change_path,
     }
 
-    out = stage_reconstruct(req, tmp_path, ctx, summary)
+    stage_reconstruct(req, tmp_path, ctx, summary)
     mesh_text = (tmp_path / "mesh.ply").read_text()
 
     # Header should now declare RGB vertex properties.
@@ -438,7 +438,7 @@ def test_change_features_carry_height_m_when_lidar_available(
         "lidar_ground_z": 5.0,
     }
 
-    out = stage_change(req, tmp_path, ctx, summary)
+    stage_change(req, tmp_path, ctx, summary)
     payload = json.loads((tmp_path / "change.geojson").read_text())
     feats = payload["features"]
     assert len(feats) == 1

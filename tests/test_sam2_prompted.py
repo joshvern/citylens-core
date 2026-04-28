@@ -106,7 +106,7 @@ def test_mode_auto_fallback_uses_prompted_when_baseline_exists(
     from citylens_core.models import CitylensRequest, PipelineSummary
     import citylens_core.stages.segment as seg_mod
 
-    ortho_path = _write_ortho(tmp_path)
+    _write_ortho(tmp_path)
     # A single square footprint in pixel space covering 30x30 of the 64x64 image.
     _write_baseline_footprints_geojson(
         tmp_path,

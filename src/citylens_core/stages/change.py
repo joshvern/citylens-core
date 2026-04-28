@@ -95,6 +95,52 @@ def _added_height_percentile() -> float:
     return _float_env("CITYLENS_CHANGE_ADDED_HEIGHT_PERCENTILE", 75.0)
 
 
+def _added_baseline_dilate_px() -> int:
+    """Pixel-radius dilation of the baseline mask used by the courtyard
+    filter on 'added' candidates.
+
+    The 1-pixel `_one_step_dilate` overlap filter only catches candidates
+    that physically TOUCH a baseline footprint — but courtyards / lightwells
+    typically sit in a 2-10 pixel gap between buildings (the GDB rasterizer
+    snaps to whole-pixel building edges and there's a small road / sidewalk
+    moat). This wider dilation lets us reject any candidate whose centroid
+    falls inside the dilated baseline mask, catching courtyards entirely
+    surrounded by buildings without rejecting genuine new construction
+    further away.
+
+    Default 8 px ≈ 4 m at 0.5 m/px — wide enough to bridge most rasterized
+    courtyard gaps, narrow enough that a real new building one parcel over
+    is still flagged.
+    """
+    return _int_env("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", 8)
+
+
+def _demolished_max_height_m() -> float:
+    """LiDAR-validated demolished gate.
+
+    The current rule labels a baseline footprint as "demolished" whenever
+    SAM2 IoU < modified_iou (0.2 by default). But SAM2 sometimes misses
+    buildings entirely — dark roofs on shadowed imagery come out IoU≈0 and
+    get wrongly labeled demolished. If LiDAR shows a real structure
+    standing inside the baseline footprint (75th-percentile height above
+    ground exceeds this threshold), downgrade the classification from
+    "demolished" → "modified" — the SAM2 mask is unreliable but LiDAR
+    confirms a building is still there.
+
+    Default 3.0 m: taller than a parked truck or hedge, shorter than every
+    real one-story building.
+    """
+    return _float_env("CITYLENS_CHANGE_DEMOLISHED_MAX_HEIGHT_M", 3.0)
+
+
+def _demolished_height_percentile() -> float:
+    """Percentile of LiDAR z-values within a baseline footprint used by the
+    demolished-rescue gate. Same rationale as `_added_height_percentile` —
+    the 75th percentile is robust to a single tall tree leaning over an
+    otherwise-empty parcel."""
+    return _float_env("CITYLENS_CHANGE_DEMOLISHED_HEIGHT_PERCENTILE", 75.0)
+
+
 # ----------------------------------------------------------------------
 # Geometry helpers
 # ----------------------------------------------------------------------
@@ -353,6 +399,39 @@ def stage_change(
     features: list[dict[str, Any]] = []
     counts = {"unchanged": 0, "modified": 0, "demolished": 0, "added": 0}
 
+    # LiDAR-validated demolished rescue. Pulled up here so both the
+    # per-source-feature path and the legacy component-labeled fallback can
+    # use it. `None` ⇒ no LiDAR available, rescue disabled (legacy
+    # behavior).
+    lidar_heights = ctx.get("lidar_heights")
+    lidar_ground_z = ctx.get("lidar_ground_z")
+    demolished_max_h = _demolished_max_height_m()
+    demolished_pctl = _demolished_height_percentile()
+    summary.qa.setdefault("demolished_downgraded_to_modified", 0)
+
+    def _classify_with_lidar_rescue(iou: float, footprint_mask) -> str:
+        """Apply IoU bands, then downgrade demolished→modified if LiDAR
+        shows a real structure standing inside the baseline footprint."""
+        if iou >= unchanged_thresh:
+            return "unchanged"
+        if iou >= modified_thresh:
+            return "modified"
+        # IoU < modified_thresh — would normally be 'demolished'. Try LiDAR
+        # rescue: if the 75th-pct height above ground is more than
+        # `demolished_max_h` meters, SAM2 likely missed the building (dark
+        # roof, shadow), so downgrade to 'modified' instead of demolished.
+        if lidar_heights is not None and lidar_ground_z is not None:
+            h_above = _lidar_height_at_mask(
+                mask=footprint_mask,
+                lidar_heights=lidar_heights,
+                lidar_ground_z=float(lidar_ground_z),
+                percentile=demolished_pctl,
+            )
+            if h_above is not None and h_above > demolished_max_h:
+                summary.qa["demolished_downgraded_to_modified"] += 1
+                return "modified"
+        return "demolished"
+
     # ------------------------------------------------------------------
     # 1. Classify each baseline footprint
     # ------------------------------------------------------------------
@@ -396,12 +475,7 @@ def stage_change(
             union = int(np.logical_or(fp_roi, im_roi).sum())
             iou = float(inter) / float(union) if union > 0 else 0.0
 
-            if iou >= unchanged_thresh:
-                change_type = "unchanged"
-            elif iou >= modified_thresh:
-                change_type = "modified"
-            else:
-                change_type = "demolished"
+            change_type = _classify_with_lidar_rescue(iou, single_mask)
             counts[change_type] += 1
 
             area_m2_val = float(single_area_px) * px_area_m2 if px_area_m2 > 0 else None
@@ -457,12 +531,7 @@ def stage_change(
             union = int(np.logical_or(comp_roi, im_roi).sum())
             iou = float(inter) / float(union) if union > 0 else 0.0
 
-            if iou >= unchanged_thresh:
-                change_type = "unchanged"
-            elif iou >= modified_thresh:
-                change_type = "modified"
-            else:
-                change_type = "demolished"
+            change_type = _classify_with_lidar_rescue(iou, comp)
             counts[change_type] += 1
 
             area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
@@ -484,13 +553,25 @@ def stage_change(
     # 2. Find "added" buildings — components in imagery that don't overlap
     #    any baseline footprint.
     # ------------------------------------------------------------------
-    # LiDAR height gate. Pulled from ctx if refine managed to sample a
-    # dense grid; `None` means "no LiDAR available, don't reject on height".
-    lidar_heights = ctx.get("lidar_heights")
-    lidar_ground_z = ctx.get("lidar_ground_z")
     added_min_height_m = _added_min_height_m()
     added_height_pctl = _added_height_percentile()
-    added_reject_reasons = {"too_small": 0, "baseline_overlap": 0, "too_short": 0}
+    added_baseline_dilate_px = _added_baseline_dilate_px()
+    added_reject_reasons = {
+        "too_small": 0,
+        "baseline_overlap": 0,
+        "centroid_near_baseline": 0,
+        "too_short": 0,
+    }
+
+    # Pre-compute the wide baseline dilation used by the courtyard /
+    # centroid-near-baseline filter. Built once outside the per-component
+    # loop because each step is O(H*W) and we'd otherwise pay it `added_n`
+    # times.
+    baseline_dilated_wide = (
+        _n_step_dilate(base, added_baseline_dilate_px)
+        if added_baseline_dilate_px > 0
+        else None
+    )
 
     added_pixels = np.logical_and(im, np.logical_not(base))
     added_labels, added_n = _label_components(added_pixels)
@@ -508,22 +589,39 @@ def stage_change(
             added_reject_reasons["baseline_overlap"] += 1
             continue
 
+        # Reject courtyards / lightwells: a candidate whose centroid lies
+        # inside a wider dilation of the baseline mask is almost certainly
+        # an interior gap between buildings (rasterized GDB footprints
+        # snap to whole-pixel edges and there's a small road/sidewalk gap,
+        # so the 1-px overlap filter above doesn't catch them).
+        if baseline_dilated_wide is not None:
+            ys_c, xs_c = np.where(comp)
+            cy = int(round(float(ys_c.mean())))
+            cx = int(round(float(xs_c.mean())))
+            h_, w_ = baseline_dilated_wide.shape
+            cy = max(0, min(h_ - 1, cy))
+            cx = max(0, min(w_ - 1, cx))
+            if bool(baseline_dilated_wide[cy, cx]):
+                added_reject_reasons["centroid_near_baseline"] += 1
+                continue
+
         # Reject things SAM2 thinks are buildings but which LiDAR says are
         # short — trees, hedges, vehicles, pavement patterns. Only gated
         # when we have LiDAR + a ground-plane estimate.
         if lidar_heights is not None and lidar_ground_z is not None:
-            cell_heights = np.asarray(lidar_heights)[comp]
-            finite = cell_heights[np.isfinite(cell_heights)]
-            if finite.size == 0:
+            height_above_ground_m = _lidar_height_at_mask(
+                mask=comp,
+                lidar_heights=lidar_heights,
+                lidar_ground_z=float(lidar_ground_z),
+                percentile=added_height_pctl,
+            )
+            if height_above_ground_m is None:
                 # No LiDAR coverage for this component. Err on the side of
                 # rejecting: in a real NYC scene the LiDAR tile usually
                 # covers real buildings. If it doesn't cover this blob,
                 # the blob is probably outside the tile's footprint too.
                 added_reject_reasons["too_short"] += 1
                 continue
-            pctl_z = float(np.percentile(finite, added_height_pctl))
-            # sample_lidar_heights returns meters already, no unit conversion.
-            height_above_ground_m = pctl_z - float(lidar_ground_z)
             if height_above_ground_m < added_min_height_m:
                 added_reject_reasons["too_short"] += 1
                 continue
@@ -576,3 +674,44 @@ def _one_step_dilate(mask):
         for dx in (0, 1, 2):
             out |= padded[dy : dy + m.shape[0], dx : dx + m.shape[1]]
     return out
+
+
+def _n_step_dilate(mask, steps: int):
+    """Iterated 3x3 dilation for `steps` rounds. Equivalent to a binary
+    dilation by an `(2*steps+1) x (2*steps+1)` square kernel.
+
+    Pure numpy (no scipy/skimage) — same pattern as `_one_step_dilate`,
+    just looped. Used by the courtyard filter on 'added' candidates: an
+    8-step dilation of the baseline mask widens each footprint by ~4 m at
+    0.5 m/px, closing the typical road/sidewalk gap so candidates whose
+    centroid lies inside the dilated mask (i.e. surrounded by buildings)
+    can be rejected.
+    """
+    import numpy as np
+
+    m = np.asarray(mask).astype(bool)
+    if steps <= 0 or not m.any():
+        return m
+    out = m
+    for _ in range(int(steps)):
+        out = _one_step_dilate(out)
+    return out
+
+
+def _lidar_height_at_mask(
+    *, mask, lidar_heights, lidar_ground_z: float, percentile: float
+) -> float | None:
+    """Return percentile-of-LiDAR height above ground inside `mask`, or
+    None when LiDAR has no finite samples covering the mask region.
+
+    Centralizes the height-sampling logic shared by the 'added' height
+    gate and the 'demolished' rescue check.
+    """
+    import numpy as np
+
+    cell_heights = np.asarray(lidar_heights)[mask]
+    finite = cell_heights[np.isfinite(cell_heights)]
+    if finite.size == 0:
+        return None
+    pctl_z = float(np.percentile(finite, percentile))
+    return pctl_z - float(lidar_ground_z)

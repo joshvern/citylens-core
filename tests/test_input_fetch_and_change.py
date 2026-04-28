@@ -290,6 +290,69 @@ def test_reconstruct_lod1_emits_per_building_extrusions(
     assert fp.sum() < heights.size
 
 
+def test_lod1_mesh_has_per_change_type_vertex_colors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Each LOD1 building's vertices should be tagged with an RGB color
+    matching its change_type, so 3D viewers can render unchanged/modified/
+    added with the same palette as the preview PNG.
+    """
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.reconstruct import (
+        _LOD1_BUILDING_COLOR,
+        stage_reconstruct,
+    )
+
+    req = CitylensRequest(address="x", segmentation_backend="sam2")
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc)
+    )
+
+    change_path = tmp_path / "change.geojson"
+    change_path.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"change_type": "modified"},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [[0, 0], [4, 0], [4, 4], [0, 4], [0, 0]]
+                            ],
+                        },
+                    },
+                ],
+            }
+        )
+    )
+
+    heights = np.full((10, 10), np.nan, dtype=np.float32)
+    heights[0:4, 0:4] = 25.0
+
+    ctx = {
+        "mask": np.ones((10, 10), dtype=np.uint8),
+        "orthophoto_transform": Affine.identity(),
+        "lidar_heights": heights,
+        "lidar_ground_z": 0.0,
+        "change_path": change_path,
+    }
+
+    out = stage_reconstruct(req, tmp_path, ctx, summary)
+    mesh_text = (tmp_path / "mesh.ply").read_text()
+
+    # Header should now declare RGB vertex properties.
+    assert "property uchar red" in mesh_text
+    assert "property uchar green" in mesh_text
+    assert "property uchar blue" in mesh_text
+
+    # The "modified" color (255 200 0) must appear on at least one vertex line.
+    r, g, b = _LOD1_BUILDING_COLOR["modified"]
+    assert f" {r} {g} {b}" in mesh_text
+
+
 def test_earclip_triangulates_concave_polygon_without_external_spokes() -> None:
     """An L-shaped polygon's centroid lands in the inner notch, OUTSIDE
     the polygon. A naive centroid-fan triangulation would emit triangles

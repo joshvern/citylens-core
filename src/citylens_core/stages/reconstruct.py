@@ -29,6 +29,17 @@ from ..io.lidar import build_height_map_from_lidar
 _LOD1_DEFAULT_HEIGHT_M = 8.0  # ~3 stories — used when a polygon has no LiDAR coverage
 _LOD1_ROOF_PERCENTILE = 95.0
 
+# Per-vertex RGB so a 3D viewer can color buildings by change classification
+# without needing a separate colormap. Same palette as the preview PNG legend
+# in stages/render.py — keep them in sync. demolished is skipped from the
+# mesh entirely so it doesn't need a color here.
+_LOD1_BUILDING_COLOR: dict[str, tuple[int, int, int]] = {
+    "unchanged": (140, 140, 140),
+    "modified": (255, 200, 0),
+    "added": (0, 200, 60),
+}
+_LOD1_DEFAULT_COLOR: tuple[int, int, int] = (140, 140, 140)
+
 
 def _load_change_features(path: Path) -> list[dict[str, Any]]:
     try:
@@ -170,15 +181,22 @@ def _extrude_ring(
     roof_z: float,
     vertices: list[tuple[float, float, float]],
     faces: list[tuple[int, int, int]],
+    *,
+    color: tuple[int, int, int] = _LOD1_DEFAULT_COLOR,
+    colors: list[tuple[int, int, int]] | None = None,
 ) -> None:
     n = len(ring_px)
     base = len(vertices)
     # bottom ring (z = ground)
     for x, y in ring_px:
         vertices.append((x, y, ground_z))
+        if colors is not None:
+            colors.append(color)
     # top ring (z = roof)
     for x, y in ring_px:
         vertices.append((x, y, roof_z))
+        if colors is not None:
+            colors.append(color)
     # wall quads, outward-facing (CCW when viewed from outside assuming
     # GeoJSON rings are CCW exterior — near enough for visualization).
     for i in range(n):
@@ -206,6 +224,7 @@ def _build_lod1_mesh(
     list[tuple[int, int, int]],
     Any,
     dict[str, int],
+    list[tuple[int, int, int]],
 ]:
     import numpy as np
     from rasterio.features import rasterize
@@ -215,6 +234,7 @@ def _build_lod1_mesh(
     inv = ~transform
 
     vertices: list[tuple[float, float, float]] = []
+    colors: list[tuple[int, int, int]] = []
     faces: list[tuple[int, int, int]] = []
     # Union of every polygon we actually extruded into the mesh — this is what
     # the QA stage IoUs against the SAM2 building mask. Demolished/skipped
@@ -225,9 +245,11 @@ def _build_lod1_mesh(
 
     for feat in features:
         props = feat.get("properties") or {}
-        if props.get("change_type") == "demolished":
+        change_type = str(props.get("change_type") or "").strip().lower()
+        if change_type == "demolished":
             stats["skipped_demolished"] += 1
             continue
+        building_color = _LOD1_BUILDING_COLOR.get(change_type, _LOD1_DEFAULT_COLOR)
         geom = feat.get("geometry")
         if not geom:
             continue
@@ -262,29 +284,46 @@ def _build_lod1_mesh(
             stats["skipped_empty"] += 1
             continue
         for ring_px in rings_px:
-            _extrude_ring(ring_px, float(ground_z), roof_z, vertices, faces)
+            _extrude_ring(
+                ring_px,
+                float(ground_z),
+                roof_z,
+                vertices,
+                faces,
+                color=building_color,
+                colors=colors,
+            )
         footprint_mask |= mask
         stats["count"] += 1
 
-    return vertices, faces, footprint_mask, stats
+    return vertices, faces, footprint_mask, stats, colors
 
 
 def _write_ply_ascii(
     out_path: Path,
     vertices: list[tuple[float, float, float]],
     faces: list[tuple[int, int, int]],
+    *,
+    colors: list[tuple[int, int, int]] | None = None,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    has_color = colors is not None and len(colors) == len(vertices)
     with out_path.open("w", encoding="utf-8") as f:
         f.write("ply\n")
         f.write("format ascii 1.0\n")
         f.write(f"element vertex {len(vertices)}\n")
         f.write("property float x\nproperty float y\nproperty float z\n")
+        if has_color:
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
         f.write(f"element face {len(faces)}\n")
         f.write("property list uchar int vertex_indices\n")
         f.write("end_header\n")
-        for x, y, z in vertices:
-            f.write(f"{x} {y} {z}\n")
+        if has_color:
+            for (x, y, z), (r, g, b) in zip(vertices, colors):
+                f.write(f"{x} {y} {z} {r} {g} {b}\n")
+        else:
+            for x, y, z in vertices:
+                f.write(f"{x} {y} {z}\n")
         for a, b, c in faces:
             f.write(f"3 {a} {b} {c}\n")
 
@@ -370,11 +409,11 @@ def stage_reconstruct(
     ):
         features = _load_change_features(Path(change_path))
         if features:
-            vertices, faces, footprint_mask, stats = _build_lod1_mesh(
+            vertices, faces, footprint_mask, stats, colors = _build_lod1_mesh(
                 features, transform, lidar_heights, float(lidar_ground_z)
             )
             if vertices and faces:
-                _write_ply_ascii(out_path, vertices, faces)
+                _write_ply_ascii(out_path, vertices, faces, colors=colors)
                 summary.qa["mesh_source"] = "lod1"
                 summary.qa["mesh_buildings"] = stats["count"]
                 summary.qa["mesh_stats"] = dict(stats)

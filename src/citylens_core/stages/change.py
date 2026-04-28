@@ -250,6 +250,7 @@ def _feature(
     imagery_year: int,
     baseline_year: int,
     crs_value: str,
+    height_m: float | None = None,
     extra_props: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     props: dict[str, Any] = {
@@ -262,6 +263,11 @@ def _feature(
         props["baseline_iou"] = round(float(baseline_iou), 4)
     if area_m2 is not None:
         props["area_m2"] = round(float(area_m2), 1)
+    if height_m is not None:
+        # 95th-pct LiDAR height above ground inside this footprint, in
+        # meters. Lets the UI show "32 m, ~10 stories" without the user
+        # parsing the mesh PLY. None when no LiDAR coverage was available.
+        props["height_m"] = round(float(height_m), 1)
     if extra_props:
         # Carry source-feature provenance (e.g. source_gdb, SourceDate) onto
         # the output so UI layers can show "from 2017 NYC OpenData" per row.
@@ -480,6 +486,17 @@ def stage_change(
 
             area_m2_val = float(single_area_px) * px_area_m2 if px_area_m2 > 0 else None
             provenance = _extract_source_provenance(src_feat.get("properties"))
+            # Sample 95th-pct LiDAR height inside the footprint so each output
+            # feature carries its own building height. Reused by UIs and by
+            # the LOD1 mesh stage. None when LiDAR isn't available.
+            feature_height_m: float | None = None
+            if lidar_heights is not None and lidar_ground_z is not None:
+                feature_height_m = _lidar_height_at_mask(
+                    mask=single_mask,
+                    lidar_heights=lidar_heights,
+                    lidar_ground_z=float(lidar_ground_z),
+                    percentile=95.0,
+                )
 
             # Emit the footprint geometry verbatim from the source geojson
             # (preserves shared edges of row houses instead of bleeding into
@@ -503,6 +520,7 @@ def stage_change(
                         imagery_year=request.imagery_year,
                         baseline_year=request.baseline_year,
                         crs_value=crs_value,
+                        height_m=feature_height_m,
                         extra_props=provenance,
                     )
                 )
@@ -535,6 +553,14 @@ def stage_change(
             counts[change_type] += 1
 
             area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
+            comp_height_m: float | None = None
+            if lidar_heights is not None and lidar_ground_z is not None:
+                comp_height_m = _lidar_height_at_mask(
+                    mask=comp,
+                    lidar_heights=lidar_heights,
+                    lidar_ground_z=float(lidar_ground_z),
+                    percentile=95.0,
+                )
             polys = _polygon_coords_from_pixel_mask(comp, transform=transform)
             for coordinates in polys:
                 features.append(
@@ -546,6 +572,7 @@ def stage_change(
                         imagery_year=request.imagery_year,
                         baseline_year=request.baseline_year,
                         crs_value=crs_value,
+                        height_m=comp_height_m,
                     )
                 )
 
@@ -608,21 +635,22 @@ def stage_change(
         # Reject things SAM2 thinks are buildings but which LiDAR says are
         # short — trees, hedges, vehicles, pavement patterns. Only gated
         # when we have LiDAR + a ground-plane estimate.
+        added_height_above_ground_m: float | None = None
         if lidar_heights is not None and lidar_ground_z is not None:
-            height_above_ground_m = _lidar_height_at_mask(
+            added_height_above_ground_m = _lidar_height_at_mask(
                 mask=comp,
                 lidar_heights=lidar_heights,
                 lidar_ground_z=float(lidar_ground_z),
                 percentile=added_height_pctl,
             )
-            if height_above_ground_m is None:
+            if added_height_above_ground_m is None:
                 # No LiDAR coverage for this component. Err on the side of
                 # rejecting: in a real NYC scene the LiDAR tile usually
                 # covers real buildings. If it doesn't cover this blob,
                 # the blob is probably outside the tile's footprint too.
                 added_reject_reasons["too_short"] += 1
                 continue
-            if height_above_ground_m < added_min_height_m:
+            if added_height_above_ground_m < added_min_height_m:
                 added_reject_reasons["too_short"] += 1
                 continue
 
@@ -639,6 +667,7 @@ def stage_change(
                     imagery_year=request.imagery_year,
                     baseline_year=request.baseline_year,
                     crs_value=crs_value,
+                    height_m=added_height_above_ground_m,
                 )
             )
 

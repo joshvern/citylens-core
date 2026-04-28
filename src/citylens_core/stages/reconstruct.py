@@ -78,6 +78,92 @@ def _feature_rings_pixel(
     return out
 
 
+def _signed_area(ring: list[tuple[float, float]]) -> float:
+    """Shoelace signed area. Positive = CCW, negative = CW."""
+    n = len(ring)
+    total = 0.0
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+        total += x1 * y2 - x2 * y1
+    return total / 2.0
+
+
+def _earclip_triangulate(ring: list[tuple[float, float]]) -> list[tuple[int, int, int]]:
+    """Triangulate a simple polygon (no holes) by ear clipping. Returns
+    triangles as triples of indices into the input ring. Handles concave
+    L/U-shaped polygons correctly (no external spokes), unlike a centroid
+    fan. Falls back to fan triangulation on degenerate inputs.
+    """
+    n = len(ring)
+    if n < 3:
+        return []
+    if n == 3:
+        return [(0, 1, 2)]
+
+    # Ensure CCW winding so the convexity test is well-defined.
+    work = ring if _signed_area(ring) > 0 else list(reversed(ring))
+    # Map back: if reversed, indices need translating to original space at end.
+    reversed_input = work is not ring
+    indices = list(range(n))
+
+    def _cross(ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> float:
+        return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+    def _point_in_tri(px: float, py: float, ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> bool:
+        d1 = _cross(px, py, ax, ay, bx, by)
+        d2 = _cross(px, py, bx, by, cx, cy)
+        d3 = _cross(px, py, cx, cy, ax, ay)
+        has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+        has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+        return not (has_neg and has_pos)
+
+    triangles: list[tuple[int, int, int]] = []
+    safety = n * n  # bail on degenerate / self-intersecting inputs
+    while len(indices) > 3 and safety > 0:
+        safety -= 1
+        clipped = False
+        m = len(indices)
+        for k in range(m):
+            i_prev = indices[(k - 1) % m]
+            i_curr = indices[k]
+            i_next = indices[(k + 1) % m]
+            ax, ay = work[i_prev]
+            bx, by = work[i_curr]
+            cx, cy = work[i_next]
+            # Convex corner? (CCW means cross > 0)
+            if _cross(ax, ay, bx, by, cx, cy) <= 0:
+                continue
+            # No other vertex inside this candidate ear?
+            ok = True
+            for other in indices:
+                if other in (i_prev, i_curr, i_next):
+                    continue
+                px, py = work[other]
+                if _point_in_tri(px, py, ax, ay, bx, by, cx, cy):
+                    ok = False
+                    break
+            if ok:
+                triangles.append((i_prev, i_curr, i_next))
+                indices.pop(k)
+                clipped = True
+                break
+        if not clipped:
+            break
+
+    if len(indices) == 3:
+        triangles.append((indices[0], indices[1], indices[2]))
+    elif len(indices) > 3:
+        # Degenerate polygon — fall back to fan from indices[0]
+        for k in range(1, len(indices) - 1):
+            triangles.append((indices[0], indices[k], indices[k + 1]))
+
+    if reversed_input:
+        # Translate ear-clip indices (in reversed ring space) back to original.
+        return [(n - 1 - a, n - 1 - b, n - 1 - c) for a, b, c in triangles]
+    return triangles
+
+
 def _extrude_ring(
     ring_px: list[tuple[float, float]],
     ground_z: float,
@@ -101,16 +187,13 @@ def _extrude_ring(
         t0, t1 = base + n + i, base + n + j
         faces.append((b0, b1, t1))
         faces.append((b0, t1, t0))
-    # roof cap: fan from centroid. Concave polygons get minor artifacts,
-    # acceptable for LOD1 MVP; building-shape polygons are close to convex.
-    cx = sum(p[0] for p in ring_px) / n
-    cy = sum(p[1] for p in ring_px) / n
-    c_idx = len(vertices)
-    vertices.append((cx, cy, roof_z))
-    for i in range(n):
-        j = (i + 1) % n
-        t0, t1 = base + n + i, base + n + j
-        faces.append((c_idx, t0, t1))
+    # Roof cap: ear-clip triangulation on the top ring. Handles L/U-shaped
+    # buildings correctly without the external "spokes" a centroid fan
+    # produces when the centroid lands outside the polygon (e.g., reflex
+    # corners on a row-house U-courtyard).
+    top_offset = base + n
+    for ti, tj, tk in _earclip_triangulate(ring_px):
+        faces.append((top_offset + ti, top_offset + tj, top_offset + tk))
 
 
 def _build_lod1_mesh(

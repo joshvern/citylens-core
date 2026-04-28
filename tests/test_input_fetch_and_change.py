@@ -290,6 +290,102 @@ def test_reconstruct_lod1_emits_per_building_extrusions(
     assert fp.sum() < heights.size
 
 
+def test_earclip_triangulates_concave_polygon_without_external_spokes() -> None:
+    """An L-shaped polygon's centroid lands in the inner notch, OUTSIDE
+    the polygon. A naive centroid-fan triangulation would emit triangles
+    that stick out into the empty notch ("spokes"). Ear clipping must
+    keep every triangle inside the polygon.
+    """
+    from citylens_core.stages.reconstruct import _earclip_triangulate
+
+    # L-shape, CCW: 6 points outlining an inverted-L (centroid in the notch).
+    #
+    #   (0,0) ---- (4,0)
+    #     |          |
+    #     |          |
+    #     |        (4,2) -------- (6,2)
+    #     |                          |
+    #   (0,6) -------------------- (6,6)
+    ring = [
+        (0.0, 0.0),
+        (4.0, 0.0),
+        (4.0, 2.0),
+        (6.0, 2.0),
+        (6.0, 6.0),
+        (0.0, 6.0),
+    ]
+    tris = _earclip_triangulate(ring)
+    assert len(tris) == 4  # N-2 = 6-2 = 4
+
+    # Every triangle's centroid must be inside the L-shape (no spokes).
+    def _point_in_polygon(p, poly):
+        x, y = p
+        n = len(poly)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > y) != (yj > y)) and x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi:
+                inside = not inside
+            j = i
+        return inside
+
+    for ti, tj, tk in tris:
+        a, b, c = ring[ti], ring[tj], ring[tk]
+        cx = (a[0] + b[0] + c[0]) / 3
+        cy = (a[1] + b[1] + c[1]) / 3
+        assert _point_in_polygon((cx, cy), ring), (
+            f"triangle ({a},{b},{c}) centroid ({cx},{cy}) lies outside the L-polygon"
+        )
+
+
+def test_change_features_carry_height_m_when_lidar_available(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Each classified change feature should expose its 95th-pct LiDAR
+    height-above-ground in properties.height_m so UIs can show building
+    heights without the user parsing the mesh PLY.
+    """
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.change import stage_change
+
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+
+    # Single 4x4 baseline footprint that the imagery covers exactly →
+    # unchanged. LiDAR shows the building is 25 m above ground.
+    base = np.zeros((10, 10), dtype=np.uint8)
+    img = np.zeros((10, 10), dtype=np.uint8)
+    base[2:6, 2:6] = 1
+    img[2:6, 2:6] = 1
+
+    heights = np.full((10, 10), np.nan, dtype=np.float32)
+    heights[2:6, 2:6] = 30.0  # 25 m above ground at z=5
+
+    req = CitylensRequest(address="x", segmentation_backend="sam2")
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc)
+    )
+    ctx = {
+        "mask": img,
+        "baseline_mask": base,
+        "orthophoto_transform": Affine.identity(),
+        "orthophoto_crs": "EPSG:3857",
+        "lidar_heights": heights,
+        "lidar_ground_z": 5.0,
+    }
+
+    out = stage_change(req, tmp_path, ctx, summary)
+    payload = json.loads((tmp_path / "change.geojson").read_text())
+    feats = payload["features"]
+    assert len(feats) == 1
+    props = feats[0]["properties"]
+    assert props["change_type"] == "unchanged"
+    # 25 m = 30 (roof) − 5 (ground)
+    assert "height_m" in props, props
+    assert abs(props["height_m"] - 25.0) < 0.5, props["height_m"]
+
+
 def test_render_change_aware_preview(tmp_path: Path) -> None:
     from PIL import Image
     from citylens_core.models import CitylensRequest, PipelineSummary

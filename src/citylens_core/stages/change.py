@@ -47,14 +47,36 @@ def _min_area_m2() -> float:
 
 
 def _unchanged_iou() -> float:
-    # Recalibrated against the wider 250m AOI Brooklyn block (169 buildings,
-    # see research/change_threshold_calibration.md). The IoU distribution is
-    # bimodal with a stable-block peak around 0.40-0.70 and a thin demolished
-    # tail near 0. At threshold 0.50 we got 44% "modified" on a block where
-    # almost nothing changed 2017→2024 — that's structural SAM2-vs-GDB edge
-    # noise, not real modification. At 0.40 we get ~17% modified, which
-    # matches what a human reviewer would flag.
+    # Default ceiling on the unchanged threshold. The actual threshold used
+    # at runtime is min(this, median_baseline_iou - 0.10), so a clean tile
+    # whose median IoU is high stays at this default while a noisy tile
+    # whose median IoU is low gets a more lenient threshold (still floored
+    # by _unchanged_iou_floor below).
+    #
+    # Calibration history:
+    # - 0.6 (initial guess) flagged 30/43 Brooklyn brownstones as 'modified'.
+    # - 0.5 (after first calibration) hit 44% modified on the wider 169-bldg
+    #   AOI.
+    # - 0.4 (current default) works for clean tiles like Brooklyn but still
+    #   flags 60%+ on dense Manhattan mixed-use (Cooper Square, median IoU
+    #   ~0.34). The adaptive logic in stage_change handles those by lowering
+    #   to median - 0.10.
     return _float_env("CITYLENS_CHANGE_UNCHANGED_IOU", 0.4)
+
+
+def _unchanged_iou_floor() -> float:
+    """Adaptive-threshold floor: never use an unchanged_iou below this even
+    when the median IoU on a tile is very low. Prevents pathological
+    tiles where SAM2 is essentially unusable from collapsing all buildings
+    into 'unchanged'."""
+    return _float_env("CITYLENS_CHANGE_UNCHANGED_IOU_FLOOR", 0.25)
+
+
+def _adaptive_threshold_min_samples() -> int:
+    """Below this many baseline IoU samples the adaptive logic doesn't kick
+    in — small/synthetic tiles use the configured `unchanged_iou` directly.
+    """
+    return _int_env("CITYLENS_CHANGE_ADAPTIVE_MIN_SAMPLES", 20)
 
 
 def _modified_iou() -> float:
@@ -668,6 +690,61 @@ def stage_change(
                     height_m=added_height_above_ground_m,
                 )
             )
+
+    # ------------------------------------------------------------------
+    # 3. Adaptive unchanged_iou threshold
+    # ------------------------------------------------------------------
+    # SAM2's segmentation quality varies a lot between tiles. On clean
+    # Brooklyn brownstones the per-baseline IoU clusters around 0.6, so a
+    # 0.4 threshold cleanly separates unchanged from modified. On dense
+    # mixed-use blocks (East Village, Williamsburg) SAM2's median IoU
+    # drops to ~0.3, and 0.4 then flags 60-70% of buildings as "modified"
+    # on stable blocks — the user perceives this as the model
+    # hallucinating change. Lower the threshold per-tile when the
+    # distribution shifts down. Cap at the configured default so clean
+    # tiles don't regress.
+    iou_samples = [
+        f["properties"]["baseline_iou"]
+        for f in features
+        if isinstance(f.get("properties"), dict)
+        and f["properties"].get("baseline_iou") is not None
+    ]
+    unchanged_thresh_used = unchanged_thresh
+    # Need a real sample size to trust the median — the adaptive logic is
+    # only meaningful on a real-world tile with many baselines, never on
+    # tests / synthetic fixtures where we'd otherwise classify the only
+    # input feature against its own IoU.
+    if len(iou_samples) >= _adaptive_threshold_min_samples():
+        median_iou = float(np.median(iou_samples))
+        summary.qa["median_baseline_iou"] = round(median_iou, 4)
+        adaptive = max(_unchanged_iou_floor(), min(unchanged_thresh, median_iou - 0.10))
+        if adaptive + 1e-9 < unchanged_thresh:
+            # Reclassify only the unchanged↔modified swing band on baseline-
+            # derived features. Don't touch demolished/added — those bands
+            # are LiDAR-validated already.
+            recls = {"unchanged_to_modified": 0, "modified_to_unchanged": 0}
+            for f in features:
+                props = f["properties"]
+                iou = props.get("baseline_iou")
+                if iou is None:
+                    continue
+                ct = props.get("change_type")
+                if ct in ("added", "demolished"):
+                    continue
+                if ct == "modified" and iou >= adaptive:
+                    counts["modified"] -= 1
+                    counts["unchanged"] += 1
+                    props["change_type"] = "unchanged"
+                    recls["modified_to_unchanged"] += 1
+                elif ct == "unchanged" and iou < adaptive and iou >= modified_thresh:
+                    counts["unchanged"] -= 1
+                    counts["modified"] += 1
+                    props["change_type"] = "modified"
+                    recls["unchanged_to_modified"] += 1
+            summary.qa["adaptive_threshold_reclassifications"] = dict(recls)
+            unchanged_thresh_used = adaptive
+            summary.qa["change_counts"] = dict(counts)
+    summary.qa["unchanged_iou_used"] = round(unchanged_thresh_used, 4)
 
     feature_collection = {"type": "FeatureCollection", "features": features}
     out_path.write_text(json.dumps(feature_collection, indent=2))

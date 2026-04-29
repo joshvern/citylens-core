@@ -183,6 +183,66 @@ def test_iou_thresholds_are_env_tunable(tmp_path: Path, monkeypatch) -> None:
     assert summary.qa["change_counts"]["modified"] == 1
 
 
+def test_adaptive_threshold_lowers_unchanged_iou_when_median_drops(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """On a tile where SAM2's median per-baseline IoU is much lower than
+    0.4 (e.g., dense Manhattan mixed-use blocks), the global 0.4 threshold
+    over-flags stable buildings as 'modified'. The adaptive logic should
+    lower the threshold to (median - 0.1) clamped to the floor, recovering
+    most of the 'unchanged' bucket.
+
+    Synthesizes 25 baseline footprints whose imagery overlap is uniformly
+    ~30% (IoU ~0.30), then asserts that the adaptive logic reclassifies
+    them from 'modified' to 'unchanged'.
+    """
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADAPTIVE_MIN_SAMPLES", "20")
+
+    H, W = 80, 80
+    base = np.zeros((H, W), dtype=np.uint8)
+    img = np.zeros((H, W), dtype=np.uint8)
+    # 25 baselines arranged in a 5x5 grid, each 10x10. Imagery covers ~30% of
+    # each (3 rows × 10 cols) → IoU ~0.30.
+    for row in range(5):
+        for col in range(5):
+            y0, x0 = 10 + row * 12, 10 + col * 12
+            base[y0 : y0 + 10, x0 : x0 + 10] = 1
+            img[y0 : y0 + 3, x0 : x0 + 10] = 1
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    counts = summary.qa["change_counts"]
+    # With adaptive: median IoU ~0.30, threshold lowered to ~0.20 (floor).
+    # All 25 baselines should land in 'unchanged' instead of 'modified'.
+    assert "median_baseline_iou" in summary.qa
+    assert summary.qa["unchanged_iou_used"] < 0.4, summary.qa
+    assert counts["unchanged"] >= 20, counts
+    # Should have recorded reclassification.
+    rec = summary.qa.get("adaptive_threshold_reclassifications") or {}
+    assert rec.get("modified_to_unchanged", 0) > 0, rec
+
+
+def test_adaptive_threshold_skipped_below_min_samples(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With fewer than the configured min samples, adaptive doesn't kick
+    in — the configured `unchanged_iou` is used as-is. Synthetic tests rely
+    on this behavior."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADAPTIVE_MIN_SAMPLES", "20")
+
+    base = np.zeros((20, 20), dtype=np.uint8)
+    img = np.zeros((20, 20), dtype=np.uint8)
+    # Single baseline with IoU ~0.30 — should classify as 'modified' under
+    # the configured 0.4 threshold, NOT get rescued by the adaptive logic.
+    base[2:12, 2:12] = 1
+    img[2:12, 2:5] = 1
+
+    _, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    assert summary.qa["change_counts"]["modified"] == 1
+    assert summary.qa["unchanged_iou_used"] == 0.4
+
+
 def test_feature_schema_has_all_expected_fields(tmp_path: Path, monkeypatch) -> None:
     """Regression: every feature must carry the full set of properties the
     frontend expects."""

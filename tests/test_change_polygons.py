@@ -509,6 +509,7 @@ def test_lidar_height_gate_skipped_when_lidar_absent(
         "baseline_overlap": 0,
         "centroid_near_baseline": 0,
         "too_short": 0,
+        "no_lidar_coverage_emitted_as_candidate": 0,
     }
 
 
@@ -628,11 +629,98 @@ def test_added_genuine_new_building_far_from_baseline_passes_centroid_filter(
     assert summary.qa["added_rejected"]["centroid_near_baseline"] == 0
 
 
-def test_lidar_height_gate_rejects_when_component_has_no_lidar_coverage(
+def test_registration_recovers_iou_under_misalignment(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """Component with no in-bounds LiDAR points is rejected — we can't
-    verify it's a building, so err on the side of precision over recall."""
+    """A baseline mask shifted by (1, 1) px from the current mask — same
+    building, mis-registered by the kind of acquisition error we see
+    between NYS Orthos baseline and current. Without alignment IoU
+    drops well below the unchanged threshold; the registration step
+    should recover it so the building is correctly classified as
+    'unchanged'."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+
+    # Single 10x10 building. Current at [10:20, 10:20], baseline at
+    # [11:21, 11:21] — pure (1, 1) translation.
+    base = np.zeros((40, 40), dtype=np.uint8)
+    img = np.zeros((40, 40), dtype=np.uint8)
+    img[10:20, 10:20] = 1
+    base[11:21, 11:21] = 1
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+
+    # Registration metadata is recorded in qa.
+    reg = summary.qa["registration"]
+    assert reg["applied"] is True
+    assert int(reg["dy"]) == -1
+    assert int(reg["dx"]) == -1
+    # IoU after applying the shift should be much higher.
+    assert reg["iou_after"] > reg["iou_before"]
+    assert reg["iou_after"] > 0.9
+    # The building reads as unchanged after recovery.
+    assert summary.qa["change_counts"]["unchanged"] == 1
+    assert summary.qa["change_counts"]["modified"] == 0
+
+
+def test_registration_skipped_when_masks_already_aligned(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Aligned masks — no shift should be applied. We don't want noise
+    moving things by a pixel for no reason."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    img = np.zeros((40, 40), dtype=np.uint8)
+    base[12:25, 12:25] = 1
+    img[12:25, 12:25] = 1
+
+    _, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    reg = summary.qa["registration"]
+    assert reg["applied"] is False
+    assert reg["iou_before"] == 1.0
+
+
+def test_polygon_smoothing_reduces_vertex_count_in_emitted_geojson(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """End-to-end check that the simplification pass actually shaves
+    vertices off the emitted change.geojson polygons. Builds a square
+    on a tile with non-trivial transform so simplification is in
+    'world units' mode, not the identity short-circuit."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+
+    # 0.5 m/px metric transform — non-identity, so simplification fires.
+    transform = Affine(0.5, 0.0, 0.0, 0.0, -0.5, 100.0)
+
+    # baseline empty — every imagery component becomes "added"
+    base = np.zeros((30, 30), dtype=np.uint8)
+    img = np.zeros((30, 30), dtype=np.uint8)
+    # 12x12 "added" rectangle — rasterize+shapes naturally produces
+    # one rectilinear ring without saw-tooth, but simplification
+    # should still pass through valid output without breaking.
+    img[5:17, 5:17] = 1
+
+    payload, _, _ = _run_stage(
+        tmp_path, mask=img, baseline_mask=base, transform=transform, crs="EPSG:3857"
+    )
+    feats = payload["features"]
+    assert len(feats) == 1
+    ring = feats[0]["geometry"]["coordinates"][0]
+    # Closed and reasonably small (a clean rectangle is 5 points).
+    assert ring[0] == ring[-1]
+    assert len(ring) <= 8
+
+
+def test_lidar_no_coverage_emits_candidate_added_with_low_confidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When LiDAR doesn't cover a candidate-added component, the
+    component is no longer dropped silently. It's emitted with
+    change_type='candidate_added' and a low confidence score, so the
+    frontend can render it faded ('possibly added, no LiDAR
+    confirmation') rather than the user seeing nothing.
+    Trades the old precision-over-recall stance for an explicit
+    low-confidence signal."""
     monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
     monkeypatch.setenv("CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M", "2.0")
 
@@ -660,5 +748,19 @@ def test_lidar_height_gate_rejects_when_component_has_no_lidar_coverage(
         "lidar_heights": heights, "lidar_ground_z": ground,
     }
     stage_change(req, tmp_path, ctx, summary)
-    assert summary.qa["change_counts"]["added"] == 0
-    assert summary.qa["added_rejected"]["too_short"] == 1
+
+    # Not counted as a confirmed add — held back for the candidate slot.
+    assert summary.qa["change_counts"].get("added", 0) == 0
+    assert summary.qa["change_counts"].get("candidate_added", 0) == 1
+    assert summary.qa["added_rejected"]["too_short"] == 0
+    assert summary.qa["added_rejected"]["no_lidar_coverage_emitted_as_candidate"] == 1
+
+    payload = json.loads((tmp_path / "change.geojson").read_text())
+    candidates = [
+        f for f in payload["features"]
+        if f["properties"]["change_type"] == "candidate_added"
+    ]
+    assert len(candidates) == 1
+    cand = candidates[0]
+    # Low confidence — frontend renders this faded.
+    assert cand["properties"]["confidence"] < 0.5

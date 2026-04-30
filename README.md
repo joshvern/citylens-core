@@ -1,18 +1,25 @@
 # citylens-core
 
-Installable, reusable pipeline core extracted from `Urban3D-DeepRecon`.
+The **reusable Python pipeline library** behind CityLens — segmentation,
+change detection, and 3D mesh reconstruction from aerial imagery. Used in
+production by [`citylens-engine`](https://github.com/joshvern/citylens-engine)
+to power the live product at **https://www.citylens.dev**.
 
-`citylens-core` is an independently runnable repo under the shared
-`/home/josh/citylens` workspace. It uses its own repo-local `.venv` and is meant
-to be opened directly in VS Code, or through a multi-root workspace that keeps
-`citylens-core`, `citylens-engine`, and `citylens-web` as separate roots.
+`citylens-core` is the algorithm layer: pure Python, no GCP, no API. It
+takes a `CitylensRequest` plus a `work_dir` and returns standard artifacts
+on disk. The engine repo owns the deployment surface (API, worker, auth,
+quotas, GCS); this repo is meant to be `pip install`-able and embedded into
+any caller — server, batch job, or notebook.
 
-Active product development happens across `citylens-core`, `citylens-engine`,
-and `citylens-web`. `Urban3D-DeepRecon` is kept as a reference implementation
-for algorithms and legacy workflow comparison.
+Companion repos:
 
-This repo is the reusable pipeline library, not the deployment target. The
-engine repo owns the API and worker deployment surfaces that consume this core.
+- [`citylens-engine`](https://github.com/joshvern/citylens-engine) — API,
+  worker, auth, quotas, artifact storage. Wraps this library.
+- [`citylens-web`](https://github.com/joshvern/citylens-web) — Next.js
+  product frontend at https://www.citylens.dev.
+
+`Urban3D-DeepRecon` is kept as a read-only reference implementation for
+algorithms and legacy workflow comparison.
 
 **Goals**
 

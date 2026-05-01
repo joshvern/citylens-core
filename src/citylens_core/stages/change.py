@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 from ..models import CitylensRequest, PipelineSummary
+from ._polygon_smoothing import (
+    estimate_pixel_tolerance_in_world_units,
+    simplify_polygon_coords,
+)
+from ._registration import apply_shift, estimate_alignment
+from ._surface_change import (
+    is_surface_changed,
+    load_surface_images,
+    surface_delta_e,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
@@ -81,6 +94,114 @@ def _adaptive_threshold_min_samples() -> int:
 
 def _modified_iou() -> float:
     return _float_env("CITYLENS_CHANGE_MODIFIED_IOU", 0.2)
+
+
+def _registration_max_shift_px() -> int:
+    """Cap on the per-tile (dy, dx) translation phase-correlation will
+    consider. Default 4 px is conservative — registration error between
+    NYS Orthos baseline and current acquisitions is typically < 2 px."""
+    return _int_env("CITYLENS_CHANGE_REGISTRATION_MAX_SHIFT_PX", 4)
+
+
+def _registration_min_confidence() -> float:
+    """Phase-correlation confidence floor. Below this, the estimated
+    shift is treated as noise and not applied."""
+    return _float_env("CITYLENS_CHANGE_REGISTRATION_MIN_CONFIDENCE", 0.15)
+
+
+def _registration_min_iou_gain() -> float:
+    """Minimum IoU improvement required to actually apply a registration
+    shift. A trivial gain (< 0.01) isn't worth the risk."""
+    return _float_env("CITYLENS_CHANGE_REGISTRATION_MIN_IOU_GAIN", 0.01)
+
+
+def _surface_delta_e_threshold() -> float:
+    """CIE76 Lab Delta-E above which a footprint with high IoU is
+    flagged as surface_changed. 20 ≈ "clearly different color/material"
+    on the perceptual scale (0–100). Below this, seasonal lighting
+    drift dominates."""
+    return _float_env("CITYLENS_CHANGE_SURFACE_DELTA_E", 20.0)
+
+
+def _polygon_simplification_pixel_tolerance() -> float:
+    """Douglas-Peucker tolerance in PIXELS. Multiplied by world-unit
+    pixel size when emitting georeferenced polygons. 0.5 px collapses
+    saw-tooth rasterization without losing real corners. Set to 0 to
+    disable simplification entirely."""
+    return _float_env("CITYLENS_CHANGE_POLYGON_SIMPLIFY_PIXELS", 0.5)
+
+
+def _candidate_added_confidence() -> float:
+    """Confidence value attached to "added" components emitted as
+    candidate_added (rejected by the LiDAR-coverage gate but otherwise
+    valid). Frontend can render these faded."""
+    return _float_env("CITYLENS_CHANGE_CANDIDATE_ADDED_CONFIDENCE", 0.3)
+
+
+# ----------------------------------------------------------------------
+# Confidence scoring (#3): every emitted feature gets a 0..1 confidence
+# derived from how far it sits from each classifier's threshold band.
+# ----------------------------------------------------------------------
+
+
+def _classification_confidence(
+    *,
+    change_type: str,
+    iou: float | None,
+    unchanged_thresh: float,
+    modified_thresh: float,
+    lidar_rescued: bool = False,
+    surface_changed: bool = False,
+) -> float:
+    """Derive a 0..1 confidence score for a classified feature.
+
+    The signal comes from how far the feature's IoU sits from the band
+    edges. Features in the middle of a band get high confidence;
+    features near a boundary get low confidence. Special cases:
+    - LiDAR-rescued demolished->modified gets capped confidence (we
+      believe the building exists but SAM2 couldn't see it).
+    - Surface-changed unchanged gets full confidence (independent
+      evidence beyond IoU).
+    """
+    if iou is None:
+        # "added" path — caller should pass a context-specific
+        # confidence; the default base is 0.7 which the candidate_added
+        # path overrides via _candidate_added_confidence().
+        return 0.7
+
+    if change_type == "unchanged":
+        # Distance above unchanged threshold, normalized to [0, 1] over
+        # the [thresh, 1.0] interval, then mapped to [0.6, 1.0] so even
+        # boundary-hugging unchanged features get a meaningful confidence.
+        span = max(1e-6, 1.0 - unchanged_thresh)
+        normalized = max(0.0, min(1.0, (iou - unchanged_thresh) / span))
+        conf = 0.6 + 0.4 * normalized
+        if surface_changed:
+            # Independent evidence reinforces the unchanged-shape call.
+            conf = max(conf, 0.85)
+        return float(conf)
+
+    if change_type == "modified":
+        # Distance from BOTH band edges. Highest confidence in the middle.
+        center = 0.5 * (modified_thresh + unchanged_thresh)
+        half_band = max(1e-6, 0.5 * (unchanged_thresh - modified_thresh))
+        proximity = max(0.0, 1.0 - abs(iou - center) / half_band)
+        conf = 0.5 + 0.4 * proximity
+        return float(conf)
+
+    if change_type == "demolished":
+        if lidar_rescued:
+            # SAM2 missed the roof but LiDAR shows a building. Result was
+            # downgraded to modified; this branch shouldn't fire, but if
+            # it does the LiDAR evidence is moderate.
+            return 0.5
+        # Pure demolished: lower IoU = higher confidence the building
+        # is gone. iou=0 → ~1.0, iou near modified_thresh → ~0.5.
+        span = max(1e-6, modified_thresh)
+        normalized = max(0.0, min(1.0, (modified_thresh - iou) / span))
+        return float(0.5 + 0.5 * normalized)
+
+    return 0.7
 
 
 def _added_max_baseline_overlap() -> float:
@@ -228,13 +349,27 @@ def _polygon_coords_from_pixel_mask(
     tr = transform if transform is not None else _affine_identity()
     polys: list[list[list[list[float]]]] = []
     m_u8 = m.astype("uint8")
+
+    # Compute the simplification tolerance once per stage call. Half a
+    # pixel collapses saw-tooth rasterization while preserving real
+    # geometry. Set CITYLENS_CHANGE_POLYGON_SIMPLIFY_PIXELS=0 to skip.
+    pixel_tol = _polygon_simplification_pixel_tolerance()
+    world_tol = (
+        estimate_pixel_tolerance_in_world_units(transform, pixel_tolerance=pixel_tol)
+        if pixel_tol > 0
+        else 0.0
+    )
+
     for geom, value in shapes(m_u8, mask=m, transform=tr):
         if int(value) != 1:
             continue
         coords = geom.get("coordinates") or []
         if not coords:
             continue
-        polys.append([list(ring) for ring in coords])
+        rings = [list(ring) for ring in coords]
+        if world_tol > 0:
+            rings = simplify_polygon_coords(rings, tolerance=world_tol)
+        polys.append(rings)
     return polys
 
 
@@ -274,6 +409,9 @@ def _feature(
     crs_value: str,
     height_m: float | None = None,
     extra_props: dict[str, Any] | None = None,
+    confidence: float | None = None,
+    surface_delta_e_value: float | None = None,
+    surface_changed: bool | None = None,
 ) -> dict[str, Any]:
     props: dict[str, Any] = {
         "change_type": change_type,
@@ -290,6 +428,18 @@ def _feature(
         # meters. Lets the UI show "32 m, ~10 stories" without the user
         # parsing the mesh PLY. None when no LiDAR coverage was available.
         props["height_m"] = round(float(height_m), 1)
+    if confidence is not None:
+        # 0..1 — how confident the classifier is in this feature's
+        # change_type. Frontend can render low-confidence features
+        # faded.
+        props["confidence"] = round(float(max(0.0, min(1.0, confidence))), 3)
+    if surface_delta_e_value is not None:
+        # Median CIE76 Lab Delta-E inside the footprint, between
+        # baseline and current imagery. Useful even when surface_changed
+        # is False as a calibration signal.
+        props["surface_delta_e"] = round(float(surface_delta_e_value), 2)
+    if surface_changed is not None:
+        props["surface_changed"] = bool(surface_changed)
     if extra_props:
         # Carry source-feature provenance (e.g. source_gdb, SourceDate) onto
         # the output so UI layers can show "from 2017 NYC OpenData" per row.
@@ -413,6 +563,52 @@ def stage_change(
     im = np.asarray(imagery_mask).astype(bool)
     base = np.asarray(baseline_mask).astype(bool)
 
+    # ------------------------------------------------------------------
+    # Sub-pixel registration (#1). Estimate one global (dy, dx) shift
+    # that aligns the baseline mask to the current mask. Recovers the
+    # per-footprint IoU lost to acquisition-year registration error
+    # (typically 0.5–2 px between NYS Orthos baseline and current).
+    # If the phase-correlation peak isn't confident enough or the IoU
+    # gain is trivial, the shift is NOT applied — defensive default.
+    # ------------------------------------------------------------------
+    registration = estimate_alignment(
+        base,
+        im,
+        max_shift_px=_registration_max_shift_px(),
+        min_confidence=_registration_min_confidence(),
+        min_iou_gain=_registration_min_iou_gain(),
+    )
+    summary.qa["registration"] = {
+        "dy": registration.dy,
+        "dx": registration.dx,
+        "confidence": round(registration.confidence, 3),
+        "iou_before": round(registration.iou_before, 4),
+        "iou_after": round(registration.iou_after, 4),
+        "applied": bool(registration.accepted),
+    }
+    if registration.accepted:
+        base = apply_shift(base, dy=registration.dy, dx=registration.dx)
+        # Keep the rasterized-footprints map in sync if the per-source
+        # path later uses it (it doesn't currently — it rasterizes from
+        # GeoJSON directly — but we set it anyway for any downstream
+        # ctx readers).
+        if ctx.get("baseline_footprints_mask") is baseline_mask:
+            ctx["baseline_footprints_mask"] = base
+
+    # ------------------------------------------------------------------
+    # Surface-change detection (#2). Re-load the orthophoto + baseline
+    # imagery so we can measure perceptual color delta inside high-IoU
+    # footprints. Lets us flag re-roofing / repainting that shape-only
+    # IoU classifies as "unchanged".
+    # ------------------------------------------------------------------
+    surface_images = load_surface_images(
+        orthophoto_path=ctx.get("orthophoto_path"),
+        baseline_path=ctx.get("baseline_path"),
+        expected_shape=im.shape,
+    )
+    surface_threshold = _surface_delta_e_threshold()
+    summary.qa["surface_change_available"] = bool(surface_images is not None)
+
     min_area_m2 = _min_area_m2()
     unchanged_thresh = _unchanged_iou()
     modified_thresh = _modified_iou()
@@ -530,6 +726,26 @@ def stage_change(
             else:
                 poly_list = []
 
+            # Surface-change check (#2). Only meaningful for unchanged
+            # features — modified/demolished already capture the change.
+            de_value: float | None = None
+            surface_flag: bool | None = None
+            if change_type == "unchanged" and surface_images is not None:
+                de_value = surface_delta_e(
+                    images=surface_images,
+                    footprint_mask=single_mask,
+                    erode_px=1,
+                )
+                surface_flag = is_surface_changed(de_value, threshold=surface_threshold)
+
+            confidence = _classification_confidence(
+                change_type=change_type,
+                iou=iou,
+                unchanged_thresh=unchanged_thresh,
+                modified_thresh=modified_thresh,
+                surface_changed=bool(surface_flag),
+            )
+
             for coordinates in poly_list:
                 features.append(
                     _feature(
@@ -542,6 +758,9 @@ def stage_change(
                         crs_value=crs_value,
                         height_m=feature_height_m,
                         extra_props=provenance,
+                        confidence=confidence,
+                        surface_delta_e_value=de_value,
+                        surface_changed=surface_flag,
                     )
                 )
     else:
@@ -581,6 +800,27 @@ def stage_change(
                     lidar_ground_z=float(lidar_ground_z),
                     percentile=95.0,
                 )
+            # Surface-change check (#2) — same as per-source path, but
+            # only on unchanged components. Pixel-space-only fallback
+            # tiles probably won't have surface_images either.
+            de_value: float | None = None
+            surface_flag: bool | None = None
+            if change_type == "unchanged" and surface_images is not None:
+                de_value = surface_delta_e(
+                    images=surface_images,
+                    footprint_mask=comp,
+                    erode_px=1,
+                )
+                surface_flag = is_surface_changed(de_value, threshold=surface_threshold)
+
+            confidence = _classification_confidence(
+                change_type=change_type,
+                iou=iou,
+                unchanged_thresh=unchanged_thresh,
+                modified_thresh=modified_thresh,
+                surface_changed=bool(surface_flag),
+            )
+
             polys = _polygon_coords_from_pixel_mask(comp, transform=transform)
             for coordinates in polys:
                 features.append(
@@ -593,6 +833,9 @@ def stage_change(
                         baseline_year=request.baseline_year,
                         crs_value=crs_value,
                         height_m=comp_height_m,
+                        confidence=confidence,
+                        surface_delta_e_value=de_value,
+                        surface_changed=surface_flag,
                     )
                 )
 
@@ -608,6 +851,7 @@ def stage_change(
         "baseline_overlap": 0,
         "centroid_near_baseline": 0,
         "too_short": 0,
+        "no_lidar_coverage_emitted_as_candidate": 0,
     }
 
     # Pre-compute the wide baseline dilation used by the courtyard /
@@ -656,6 +900,7 @@ def stage_change(
         # short — trees, hedges, vehicles, pavement patterns. Only gated
         # when we have LiDAR + a ground-plane estimate.
         added_height_above_ground_m: float | None = None
+        emit_as_candidate = False  # #5: True iff LiDAR has no coverage for this comp.
         if lidar_heights is not None and lidar_ground_z is not None:
             added_height_above_ground_m = _lidar_height_at_mask(
                 mask=comp,
@@ -664,23 +909,39 @@ def stage_change(
                 percentile=added_height_pctl,
             )
             if added_height_above_ground_m is None:
-                # No LiDAR coverage for this component. Err on the side of
-                # rejecting: in a real NYC scene the LiDAR tile usually
-                # covers real buildings. If it doesn't cover this blob,
-                # the blob is probably outside the tile's footprint too.
-                added_reject_reasons["too_short"] += 1
-                continue
-            if added_height_above_ground_m < added_min_height_m:
+                # No LiDAR coverage for this component. Don't fully drop
+                # it — the candidate may be a real building outside the
+                # LiDAR tile's footprint. Emit with change_type =
+                # "candidate_added" and a low confidence, so frontends
+                # can render it faded ("possibly added, no LiDAR
+                # confirmation").
+                added_reject_reasons["no_lidar_coverage_emitted_as_candidate"] += 1
+                emit_as_candidate = True
+            elif added_height_above_ground_m < added_min_height_m:
                 added_reject_reasons["too_short"] += 1
                 continue
 
-        counts["added"] += 1
+        if emit_as_candidate:
+            change_type_emitted = "candidate_added"
+            counts.setdefault("candidate_added", 0)
+            counts["candidate_added"] += 1
+            confidence_emitted = _candidate_added_confidence()
+        else:
+            change_type_emitted = "added"
+            counts["added"] += 1
+            confidence_emitted = _classification_confidence(
+                change_type="added",
+                iou=None,
+                unchanged_thresh=unchanged_thresh,
+                modified_thresh=modified_thresh,
+            )
+
         area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
         polys = _polygon_coords_from_pixel_mask(comp, transform=transform)
         for coordinates in polys:
             features.append(
                 _feature(
-                    change_type="added",
+                    change_type=change_type_emitted,
                     coordinates=coordinates,
                     area_m2=area_m2_val,
                     baseline_iou=None,
@@ -688,6 +949,7 @@ def stage_change(
                     baseline_year=request.baseline_year,
                     crs_value=crs_value,
                     height_m=added_height_above_ground_m,
+                    confidence=confidence_emitted,
                 )
             )
 

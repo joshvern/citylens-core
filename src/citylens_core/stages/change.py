@@ -300,23 +300,46 @@ def _added_height_percentile() -> float:
 
 
 def _added_baseline_dilate_px() -> int:
-    """Pixel-radius dilation of the baseline mask used by the courtyard
-    filter on 'added' candidates.
+    """Pixel-radius dilation of the baseline mask used by the courtyard +
+    near-baseline filters on 'added' candidates.
 
     The 1-pixel `_one_step_dilate` overlap filter only catches candidates
-    that physically TOUCH a baseline footprint — but courtyards / lightwells
-    typically sit in a 2-10 pixel gap between buildings (the GDB rasterizer
-    snaps to whole-pixel building edges and there's a small road / sidewalk
-    moat). This wider dilation lets us reject any candidate whose centroid
-    falls inside the dilated baseline mask, catching courtyards entirely
-    surrounded by buildings without rejecting genuine new construction
-    further away.
+    that physically TOUCH a baseline footprint — but two failure modes
+    sit further out:
 
-    Default 8 px ≈ 4 m at 0.5 m/px — wide enough to bridge most rasterized
-    courtyard gaps, narrow enough that a real new building one parcel over
-    is still flagged.
+    1. Courtyards / lightwells: 2-10 px gap between rasterized GDB
+       footprints (sidewalk moat).
+    2. Existing buildings the matcher missed because per-feature
+       registration didn't apply: imagery mask is offset by 2-7m from the
+       baseline, so the imagery component falls in apparently-empty space
+       that's actually right next to a baseline footprint.
+
+    Default 24 px ≈ 7 m at 0.3 m/px (12 m at 0.5 m/px). Wide enough to
+    span the typical NYC alignment-error budget AND most rasterized
+    courtyard gaps; narrow enough that a genuine new building one parcel
+    over (≥10m clearance) is still flagged. Bump to 32+ in dense
+    neighborhoods if false-positive 'added' polygons are still slipping
+    through; drop back to 8 in sparse / rural data where baselines are
+    sparse and any non-overlap is a real new structure.
     """
-    return _int_env("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", 8)
+    return _int_env("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", 24)
+
+
+def _added_max_inside_dilation_frac() -> float:
+    """Reject 'added' candidates that are mostly *inside* the wide-dilated
+    baseline.
+
+    The centroid-only filter checks one pixel and misses large blobs whose
+    centroid happens to fall in a gap between baselines (e.g., a 30×50m
+    imagery component sitting on top of three baseline footprints — its
+    centroid lands in the small interior void between them). Rejecting
+    when ≥50% of the candidate's pixels lie inside the dilated baseline
+    catches those cases without flipping legitimate new construction
+    (which has ≪50% overlap with any nearby baseline dilation).
+
+    Set to 1.0 to disable.
+    """
+    return _float_env("CITYLENS_CHANGE_ADDED_MAX_INSIDE_DILATION_FRAC", 0.5)
 
 
 def _demolished_max_height_m() -> float:
@@ -919,10 +942,12 @@ def stage_change(
     added_min_height_m = _added_min_height_m()
     added_height_pctl = _added_height_percentile()
     added_baseline_dilate_px = _added_baseline_dilate_px()
+    added_max_inside_dilation_frac = _added_max_inside_dilation_frac()
     added_reject_reasons = {
         "too_small": 0,
         "baseline_overlap": 0,
         "centroid_near_baseline": 0,
+        "majority_inside_baseline_dilation": 0,
         "too_short": 0,
         "no_lidar_coverage_emitted_as_candidate": 0,
     }
@@ -953,11 +978,15 @@ def stage_change(
             added_reject_reasons["baseline_overlap"] += 1
             continue
 
-        # Reject courtyards / lightwells: a candidate whose centroid lies
-        # inside a wider dilation of the baseline mask is almost certainly
-        # an interior gap between buildings (rasterized GDB footprints
-        # snap to whole-pixel edges and there's a small road/sidewalk gap,
-        # so the 1-px overlap filter above doesn't catch them).
+        # Reject courtyards / lightwells / alignment-error twins: any
+        # candidate whose centroid lies inside the wide-dilated baseline
+        # mask is almost certainly either an interior gap between
+        # buildings (rasterized GDB footprints snap to whole-pixel edges
+        # and there's a small road/sidewalk gap) or an existing building
+        # the matcher missed because per-feature registration didn't
+        # apply (imagery mask is offset by a few meters from the baseline
+        # footprint, so the unmatched imagery component sits a few pixels
+        # away from "its" baseline polygon).
         if baseline_dilated_wide is not None:
             ys_c, xs_c = np.where(comp)
             cy = int(round(float(ys_c.mean())))
@@ -968,6 +997,22 @@ def stage_change(
             if bool(baseline_dilated_wide[cy, cx]):
                 added_reject_reasons["centroid_near_baseline"] += 1
                 continue
+
+            # Centroid-only is one pixel — a 30×50m imagery blob sitting
+            # on top of three baseline footprints can have its centroid
+            # land in the small void between them and pass the check
+            # above. Reject when a majority of the component's pixels are
+            # inside the wide-dilated baseline; legitimate new
+            # construction has well under 50% overlap with any nearby
+            # baseline dilation.
+            if added_max_inside_dilation_frac < 1.0:
+                inside_px = int(np.logical_and(comp, baseline_dilated_wide).sum())
+                inside_frac = (
+                    float(inside_px) / float(comp_area_px) if comp_area_px else 0.0
+                )
+                if inside_frac >= added_max_inside_dilation_frac:
+                    added_reject_reasons["majority_inside_baseline_dilation"] += 1
+                    continue
 
         # Reject things SAM2 thinks are buildings but which LiDAR says are
         # short — trees, hedges, vehicles, pavement patterns. Only gated

@@ -8,9 +8,10 @@ from pathlib import Path
 
 import numpy as np
 from affine import Affine
+from PIL import Image
 
 
-def _run_stage(tmp_path: Path, *, mask, baseline_mask, transform=None, crs=None):
+def _run_stage(tmp_path: Path, *, mask, baseline_mask, transform=None, crs=None, ctx_extra=None):
     from citylens_core.models import CitylensRequest, PipelineSummary
     from citylens_core.stages.change import stage_change
 
@@ -28,6 +29,8 @@ def _run_stage(tmp_path: Path, *, mask, baseline_mask, transform=None, crs=None)
         ctx["orthophoto_transform"] = transform
     if crs is not None:
         ctx["orthophoto_crs"] = crs
+    if ctx_extra:
+        ctx.update(ctx_extra)
     out = stage_change(req, tmp_path, ctx, summary)
     payload = json.loads((tmp_path / "change.geojson").read_text())
     return payload, summary, out
@@ -698,6 +701,52 @@ def test_registration_recovers_iou_under_misalignment(
     assert summary.qa["change_counts"]["modified"] == 0
 
 
+def test_registration_recovers_per_source_feature_iou_without_moving_output_geometry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Production uses the per-source GeoJSON path. Accepted registration
+    must improve the scoring mask there too, while emitted source geometry
+    remains in its original CRS coordinates."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "0.01")
+
+    src_geom = [[[14, 14], [24, 14], [24, 24], [14, 24], [14, 14]]]
+    _write_baseline_geojson(
+        tmp_path,
+        [
+            {
+                "type": "Feature",
+                "properties": {"source_gdb": "test.gdb"},
+                "geometry": {"type": "Polygon", "coordinates": src_geom},
+            }
+        ],
+    )
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    img = np.zeros((40, 40), dtype=np.uint8)
+    base[14:24, 14:24] = 1
+    img[10:20, 10:20] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=img,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    reg = summary.qa["registration"]
+    assert reg["applied"] is True
+    assert int(reg["dy"]) == -4
+    assert int(reg["dx"]) == -4
+    assert summary.qa["change_source"] == "per_source_feature"
+    assert summary.qa["change_counts"]["unchanged"] == 1
+    assert summary.qa["change_counts"]["modified"] == 0
+
+    feature = payload["features"][0]
+    assert feature["properties"]["baseline_iou"] >= 0.99
+    assert feature["geometry"]["coordinates"] == src_geom
+
+
 def test_registration_skipped_when_masks_already_aligned(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -913,6 +962,42 @@ def test_borderline_modified_reclassified_to_unchanged_when_no_surface_evidence(
         assert f["properties"]["confidence"] <= 0.55
 
 
+def test_one_band_baseline_mask_does_not_act_as_surface_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Production baseline.tif is a one-band footprint mask. It must not be
+    converted to RGB and treated as historical orthophoto evidence, otherwise
+    every gray roof can look like a high-Delta-E surface change."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "0.01")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADAPTIVE_MIN_SAMPLES", "20")
+
+    base, img, transform = _make_borderline_tile(
+        tmp_path, n_features=25, cover_pixels=22
+    )
+    current_path = tmp_path / "orthophoto.png"
+    baseline_path = tmp_path / "baseline.tif"
+    Image.fromarray(np.full((*base.shape, 3), 128, dtype=np.uint8)).save(current_path)
+    Image.fromarray((base * 255).astype(np.uint8)).save(baseline_path)
+
+    _, summary, _ = _run_stage(
+        tmp_path,
+        mask=img,
+        baseline_mask=base,
+        transform=transform,
+        crs="EPSG:3857",
+        ctx_extra={
+            "orthophoto_path": current_path,
+            "baseline_path": baseline_path,
+        },
+    )
+
+    assert summary.qa["surface_change_available"] is False
+    recls = summary.qa.get("borderline_modified_reclassifications") or {}
+    assert recls.get("kept_by_surface_change", 0) == 0
+    assert recls.get("to_unchanged", 0) >= 20, recls
+    assert summary.qa["change_counts"]["modified"] == 0
+
+
 def test_borderline_modified_kept_when_surface_evidence_confirms_change(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1052,4 +1137,3 @@ def test_borderline_pass_does_not_touch_demolished_or_added(
     # Borderline pass moved the modifieds but left the demolished alone.
     recls = summary.qa.get("borderline_modified_reclassifications") or {}
     assert recls.get("to_unchanged", 0) >= 20
-

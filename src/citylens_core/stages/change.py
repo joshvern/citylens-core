@@ -673,9 +673,7 @@ def stage_change(
     if registration.accepted:
         base = apply_shift(base, dy=registration.dy, dx=registration.dx)
         # Keep the rasterized-footprints map in sync if the per-source
-        # path later uses it (it doesn't currently — it rasterizes from
-        # GeoJSON directly — but we set it anyway for any downstream
-        # ctx readers).
+        # path later uses it and for downstream ctx readers.
         if ctx.get("baseline_footprints_mask") is baseline_mask:
             ctx["baseline_footprints_mask"] = base
 
@@ -764,9 +762,17 @@ def stage_change(
                 # Footprint falls outside the ortho bbox — can't classify.
                 continue
 
+            scoring_mask = (
+                apply_shift(single_mask, dy=registration.dy, dx=registration.dx).astype(bool)
+                if registration.accepted
+                else single_mask
+            )
+            if not scoring_mask.any():
+                scoring_mask = single_mask
+
             # IoU measured within the footprint's bbox (pad 10%) so a
             # single large SAM2 blob can't swallow every neighbor.
-            ys, xs = np.where(single_mask)
+            ys, xs = np.where(scoring_mask)
             y0, y1 = int(ys.min()), int(ys.max()) + 1
             x0, x1 = int(xs.min()), int(xs.max()) + 1
             pad_y = max(1, (y1 - y0) // 10)
@@ -775,13 +781,13 @@ def stage_change(
             x0 = max(0, x0 - pad_x)
             y1 = min(h, y1 + pad_y)
             x1 = min(w, x1 + pad_x)
-            fp_roi = single_mask[y0:y1, x0:x1]
+            fp_roi = scoring_mask[y0:y1, x0:x1]
             im_roi = im[y0:y1, x0:x1]
             inter = int(np.logical_and(fp_roi, im_roi).sum())
             union = int(np.logical_or(fp_roi, im_roi).sum())
             iou = float(inter) / float(union) if union > 0 else 0.0
 
-            change_type = _classify_with_lidar_rescue(iou, single_mask)
+            change_type = _classify_with_lidar_rescue(iou, scoring_mask)
             counts[change_type] += 1
 
             area_m2_val = float(single_area_px) * px_area_m2 if px_area_m2 > 0 else None
@@ -792,7 +798,7 @@ def stage_change(
             feature_height_m: float | None = None
             if lidar_heights is not None and lidar_ground_z is not None:
                 feature_height_m = _lidar_height_at_mask(
-                    mask=single_mask,
+                    mask=scoring_mask,
                     lidar_heights=lidar_heights,
                     lidar_ground_z=float(lidar_ground_z),
                     percentile=95.0,
@@ -824,7 +830,7 @@ def stage_change(
             ):
                 de_value = surface_delta_e(
                     images=surface_images,
-                    footprint_mask=single_mask,
+                    footprint_mask=scoring_mask,
                     erode_px=1,
                 )
                 surface_flag = is_surface_changed(de_value, threshold=surface_threshold)

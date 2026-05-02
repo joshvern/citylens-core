@@ -46,7 +46,7 @@ def load_surface_images(
     if current is None:
         return None
 
-    baseline = _load_rgb(baseline_path)
+    baseline = _load_rgb(baseline_path, require_color=True)
     if baseline is None:
         return None
 
@@ -60,13 +60,21 @@ def load_surface_images(
     return SurfaceImages(current_rgb=current, baseline_rgb=baseline)
 
 
-def _load_rgb(path: Path) -> np.ndarray | None:
-    """Load an image as (H, W, 3) uint8. Returns None on any failure."""
+def _load_rgb(path: Path, *, require_color: bool = False) -> np.ndarray | None:
+    """Load an image as (H, W, 3) uint8. Returns None on any failure.
+
+    When require_color=True, reject single-band/palette/gray images before
+    conversion. The engine's production baseline.tif is a one-band footprint
+    mask, not a historical orthophoto; converting it to RGB would create bogus
+    surface-change evidence.
+    """
     try:
         p = Path(path)
         if not p.exists() or not p.is_file():
             return None
         with Image.open(p) as im:
+            if require_color and len(im.getbands()) < 3:
+                return None
             im.load()
             rgb = im.convert("RGB")
             arr = np.asarray(rgb, dtype=np.uint8)

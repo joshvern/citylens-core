@@ -157,6 +157,22 @@ def test_load_surface_images_missing_file(tmp_path: Path) -> None:
     assert load_surface_images(orthophoto_path=real, baseline_path=None) is None
 
 
+def test_load_surface_images_rejects_one_band_baseline_mask(tmp_path: Path) -> None:
+    current = tmp_path / "current.png"
+    baseline_mask = tmp_path / "baseline.tif"
+    Image.fromarray(_solid_rgb(16, 16, (120, 130, 140))).save(current)
+    Image.fromarray(np.eye(16, dtype=np.uint8) * 255).save(baseline_mask)
+
+    assert (
+        load_surface_images(
+            orthophoto_path=current,
+            baseline_path=baseline_mask,
+            expected_shape=(16, 16),
+        )
+        is None
+    )
+
+
 def test_load_surface_images_bad_file(tmp_path: Path) -> None:
     bad = tmp_path / "bad.png"
     bad.write_text('{"type": "FeatureCollection", "features": []}')

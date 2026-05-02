@@ -93,6 +93,10 @@ def test_demolished_building_gets_demolished_feature(tmp_path: Path, monkeypatch
 def test_added_building_gets_added_feature(tmp_path: Path, monkeypatch) -> None:
     """Current-year component that doesn't touch any baseline footprint → added."""
     monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "16")
+    # The default near-baseline dilation is 24 px; on a 30×30 grid every
+    # pixel is within 24 px of the baseline. Drop to 8 px for this test so
+    # the "isolated building" stays genuinely isolated.
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", "8")
 
     base = np.zeros((30, 30), dtype=np.uint8)
     img = np.zeros((30, 30), dtype=np.uint8)
@@ -508,6 +512,7 @@ def test_lidar_height_gate_skipped_when_lidar_absent(
         "too_small": 0,
         "baseline_overlap": 0,
         "centroid_near_baseline": 0,
+        "majority_inside_baseline_dilation": 0,
         "too_short": 0,
         "no_lidar_coverage_emitted_as_candidate": 0,
     }
@@ -627,6 +632,37 @@ def test_added_genuine_new_building_far_from_baseline_passes_centroid_filter(
     payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
     assert summary.qa["change_counts"]["added"] == 1
     assert summary.qa["added_rejected"]["centroid_near_baseline"] == 0
+
+
+def test_added_default_dilate_catches_misaligned_existing_building(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If per-feature registration didn't apply, the imagery mask of an
+    existing building can sit 5-7m (≈18-24 px at 0.3 m/px) away from its
+    baseline footprint. The matcher then misses it and the 'added' pass
+    sees a clean component near (but not touching) a baseline. The
+    default dilation (24 px) must catch this case."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    # No CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX override → exercise the
+    # default of 24.
+
+    base = np.zeros((80, 80), dtype=np.uint8)
+    img = np.zeros((80, 80), dtype=np.uint8)
+    base[20:30, 20:30] = 1
+    # Same building shape, shifted ~6 m at 0.3 m/px (20 px) to the right —
+    # alignment-error-twin scenario. Centroid of the imagery component is
+    # 24 px east of the baseline centroid, well inside the 24-px dilation.
+    img[20:30, 40:50] = 1
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    # Should NOT be classified as a new building; the near-baseline gate
+    # (centroid-in-dilation OR majority-inside-dilation) catches it.
+    assert summary.qa["change_counts"]["added"] == 0
+    rej = summary.qa["added_rejected"]
+    assert (
+        rej["centroid_near_baseline"] >= 1
+        or rej["majority_inside_baseline_dilation"] >= 1
+    ), rej
 
 
 def test_registration_recovers_iou_under_misalignment(

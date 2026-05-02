@@ -764,3 +764,256 @@ def test_lidar_no_coverage_emits_candidate_added_with_low_confidence(
     cand = candidates[0]
     # Low confidence — frontend renders this faded.
     assert cand["properties"]["confidence"] < 0.5
+
+
+# ---------------------------------------------------------------------------
+# Borderline-modified reclassification (two-stage classifier).
+# ---------------------------------------------------------------------------
+
+
+def _make_borderline_tile(
+    tmp_path: Path,
+    *,
+    n_features: int = 25,
+    cover_pixels: int = 22,
+):
+    """Build a baseline_footprints.geojson + raster pair where every 10x10
+    footprint has exactly `cover_pixels` px of imagery overlap → per-feature
+    IoU = cover_pixels / 100. Returns (base, img, transform).
+
+    Default cover_pixels=22 → IoU=0.22 per feature, median=0.22 → adaptive
+    lowers unchanged_iou to 0.25 (floor), so every feature stays classified
+    as 'modified' (IoU 0.22 < 0.25) while sitting comfortably inside the
+    borderline band [0.20, 0.25). This lets the borderline-reclassification
+    pass act on every feature in the test.
+    """
+    # Stride needs to exceed the footprint size + ROI padding so the
+    # per-source-feature IoU loop doesn't see neighboring footprints'
+    # imagery bleed into one footprint's ROI. Padding is max(1, side/10)
+    # = 1 each side, so 14 rows of clearance is plenty.
+    STRIDE = 14
+    H = max(20, STRIDE * n_features + 20)
+    W = 60
+    base = np.zeros((H, W), dtype=np.uint8)
+    img = np.zeros((H, W), dtype=np.uint8)
+    feats = []
+    # Each baseline = 10x10 = 100 px. Cover `cover_pixels` of them with
+    # imagery so IoU = cover/100 is exact. We fill row-major to make the
+    # masked region a contiguous block.
+    cover_pixels = max(1, min(99, cover_pixels))
+    full_rows, leftover_cols = divmod(cover_pixels, 10)
+    for i in range(n_features):
+        y0 = 5 + i * STRIDE
+        x0 = 5
+        if y0 + 10 >= H:
+            break
+        base[y0 : y0 + 10, x0 : x0 + 10] = 1
+        if full_rows > 0:
+            img[y0 : y0 + full_rows, x0 : x0 + 10] = 1
+        if leftover_cols > 0:
+            img[y0 + full_rows, x0 : x0 + leftover_cols] = 1
+        feats.append(
+            {
+                "type": "Feature",
+                "properties": {"source_gdb": "test.gdb"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [x0, y0],
+                            [x0 + 10, y0],
+                            [x0 + 10, y0 + 10],
+                            [x0, y0 + 10],
+                            [x0, y0],
+                        ]
+                    ],
+                },
+            }
+        )
+    _write_baseline_geojson(tmp_path, feats)
+    return base, img, Affine.identity()
+
+
+def test_borderline_modified_reclassified_to_unchanged_when_no_surface_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Build 25 footprints whose IoU lands in the (post-adaptive) borderline
+    band. Without surface_changed evidence (no RGB baseline wired up — same
+    state as production today), each one should get reclassified from
+    'modified' to 'unchanged' with a low confidence and a
+    `borderline_reclassified=True` provenance flag."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "0.01")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADAPTIVE_MIN_SAMPLES", "20")
+    # IoU 0.22: median=0.22 → adaptive lowers unchanged_iou to 0.25 (floor),
+    # IoU 0.22 < 0.25 → all stay 'modified'; the borderline band [0.20, 0.25]
+    # then catches every feature in the second-stage pass.
+    base, img, transform = _make_borderline_tile(
+        tmp_path, n_features=25, cover_pixels=22
+    )
+    payload, summary, _ = _run_stage(
+        tmp_path, mask=img, baseline_mask=base,
+        transform=transform, crs="EPSG:3857",
+    )
+
+    # Adaptive threshold should have fired and lowered to the floor.
+    assert summary.qa["unchanged_iou_used"] == 0.25, summary.qa
+    # Borderline pass should have moved every feature into 'unchanged'.
+    recls = summary.qa.get("borderline_modified_reclassifications") or {}
+    assert recls.get("to_unchanged", 0) >= 20, recls
+    # No feature should have been kept by surface evidence (none available).
+    assert recls.get("kept_by_surface_change", 0) == 0
+    # `change_counts` must reflect the reclassification.
+    assert summary.qa["change_counts"]["modified"] == 0, summary.qa["change_counts"]
+    assert summary.qa["change_counts"]["unchanged"] >= 20
+
+    # Provenance flag visible on the geojson, with reduced confidence.
+    flagged = [
+        f for f in payload["features"]
+        if f["properties"].get("borderline_reclassified")
+    ]
+    assert len(flagged) >= 20
+    for f in flagged:
+        assert f["properties"]["change_type"] == "unchanged"
+        assert f["properties"]["confidence"] <= 0.55
+
+
+def test_borderline_modified_kept_when_surface_evidence_confirms_change(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A feature with borderline IoU + surface_changed=True (real visual
+    change confirmed by Δ-E) keeps its 'modified' label even after the
+    borderline pass. Stubs the surface-change helper so we can drive
+    surface_changed deterministically without needing an RGB baseline."""
+    from citylens_core.stages import change as change_mod
+
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "0.01")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADAPTIVE_MIN_SAMPLES", "20")
+
+    base, img, transform = _make_borderline_tile(
+        tmp_path, n_features=25, cover_pixels=22
+    )
+
+    # Stub surface-image loader so the stage believes RGB imagery is
+    # available, AND stub surface_delta_e to return a value above the
+    # threshold (≥ 20.0) so every borderline modified gets `surface_changed`
+    # = True. With surface confirmation the borderline pass must NOT
+    # reclassify any of them to unchanged.
+    class _StubSurface:
+        current_rgb = np.zeros((1, 1, 3), dtype=np.uint8)
+        baseline_rgb = np.zeros((1, 1, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(
+        change_mod, "load_surface_images",
+        lambda *args, **kwargs: _StubSurface(),
+    )
+    monkeypatch.setattr(
+        change_mod, "surface_delta_e",
+        lambda *args, **kwargs: 99.0,  # comfortably above threshold
+    )
+    # is_surface_changed reads the threshold env var; default 20.0 is fine.
+
+    _, summary, _ = _run_stage(
+        tmp_path, mask=img, baseline_mask=base,
+        transform=transform, crs="EPSG:3857",
+    )
+
+    recls = summary.qa.get("borderline_modified_reclassifications") or {}
+    assert recls.get("to_unchanged", 0) == 0, recls
+    assert recls.get("kept_by_surface_change", 0) >= 20, recls
+    # The features stay classified as modified.
+    assert summary.qa["change_counts"]["modified"] >= 20
+
+
+def test_borderline_modified_pass_skipped_with_zero_margin(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Setting margin to 0 disables the borderline pass entirely — historical
+    behavior before this fix shipped. `change_counts` should match the
+    pre-margin run."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "0.01")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADAPTIVE_MIN_SAMPLES", "20")
+    monkeypatch.setenv("CITYLENS_CHANGE_MODIFIED_BORDERLINE_MARGIN", "0")
+
+    base, img, transform = _make_borderline_tile(
+        tmp_path, n_features=25, cover_pixels=22
+    )
+    _, summary, _ = _run_stage(
+        tmp_path, mask=img, baseline_mask=base,
+        transform=transform, crs="EPSG:3857",
+    )
+
+    # Pass shouldn't have moved anything.
+    recls = summary.qa.get("borderline_modified_reclassifications") or {}
+    assert recls.get("to_unchanged", 0) == 0
+    # The qa.borderline_modified_margin field should still be emitted with
+    # the configured value, so operators can audit "was this pass on?"
+    assert summary.qa["borderline_modified_margin"] == 0.0
+
+
+def test_borderline_modified_pass_skipped_below_min_samples(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With fewer features than the adaptive-min-samples threshold, the
+    borderline pass doesn't fire (same gating as adaptive — synthetic single-
+    feature tests must keep their pre-margin behavior)."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADAPTIVE_MIN_SAMPLES", "20")
+
+    # Single baseline with IoU ~0.9, threshold raised to 0.95 → modified.
+    # Borderline band would otherwise [0.90, 0.95) — IoU=0.9 sits at the
+    # band edge, which would trigger reclassification IF the pass ran.
+    base = np.zeros((20, 20), dtype=np.uint8)
+    img = np.zeros((20, 20), dtype=np.uint8)
+    base[2:12, 2:12] = 1
+    img[2:11, 2:12] = 1  # IoU ≈ 0.9
+    monkeypatch.setenv("CITYLENS_CHANGE_UNCHANGED_IOU", "0.95")
+
+    _, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    # 1 feature is well below the min-samples gate → pass skipped.
+    assert summary.qa["change_counts"]["modified"] == 1
+    recls = summary.qa.get("borderline_modified_reclassifications") or {}
+    assert recls.get("to_unchanged", 0) == 0
+
+
+def test_borderline_pass_does_not_touch_demolished_or_added(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Demolished + added features are LiDAR-validated (or come from a
+    different code path) — the borderline pass must not reclassify them
+    even when they coexist with borderline modifieds on the same tile."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "0.01")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADAPTIVE_MIN_SAMPLES", "20")
+    base, img, transform = _make_borderline_tile(
+        tmp_path, n_features=25, cover_pixels=22
+    )
+    # Inject a clearly-demolished baseline (zero current coverage) — IoU=0.
+    # No LiDAR is supplied so it stays as 'demolished' (no rescue).
+    base[55:62, 30:37] = 1
+    # Read existing geojson, append demolished feature.
+    gj_path = tmp_path / "baseline_footprints.geojson"
+    payload = json.loads(gj_path.read_text())
+    payload["features"].append(
+        {
+            "type": "Feature",
+            "properties": {"source_gdb": "test.gdb"},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [[30, 55], [37, 55], [37, 62], [30, 62], [30, 55]]
+                ],
+            },
+        }
+    )
+    gj_path.write_text(json.dumps(payload))
+
+    _, summary, _ = _run_stage(
+        tmp_path, mask=img, baseline_mask=base,
+        transform=transform, crs="EPSG:3857",
+    )
+
+    # Demolished still counted (untouched by the borderline pass).
+    assert summary.qa["change_counts"]["demolished"] == 1, summary.qa
+    # Borderline pass moved the modifieds but left the demolished alone.
+    recls = summary.qa.get("borderline_modified_reclassifications") or {}
+    assert recls.get("to_unchanged", 0) >= 20
+

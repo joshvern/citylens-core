@@ -50,6 +50,20 @@ def _int_env(name: str, default: int) -> int:
     return max(0, value)
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    """Truthy/falsy parse for env vars. Accepts 1/0, true/false, yes/no, on/off
+    (case-insensitive). Anything else falls back to the provided default — we
+    never want a typo in a tunable to silently flip behavior."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def _min_area_m2() -> float:
     """Drop change features smaller than this area in square meters.
 
@@ -94,6 +108,53 @@ def _adaptive_threshold_min_samples() -> int:
 
 def _modified_iou() -> float:
     return _float_env("CITYLENS_CHANGE_MODIFIED_IOU", 0.2)
+
+
+def _modified_borderline_margin() -> float:
+    """IoU width below the (post-adaptive) unchanged threshold inside which a
+    "modified" classification is treated as a borderline call.
+
+    Built to address the dominant production failure mode observed across
+    Manhattan / Williamsburg demos (Cooper Square, Hudson Yards, LIC Borden,
+    Bedford-Williamsburg): the per-footprint IoU distribution clusters just
+    below the unchanged threshold, so 10–25 % of buildings get flagged as
+    "modified" between 2017 and 2024 even though most of those neighborhoods
+    didn't actually change. The IoU drop in those cases is segmentation
+    noise and sub-pixel registration drift, NOT a real building modification.
+
+    Set to 0 to disable the borderline-reclassification pass entirely (the
+    pass otherwise demotes borderline modifieds to unchanged unless the
+    surface-change Δ-E signal independently confirms a visual change). The
+    historical pre-margin behavior is recovered with margin=0.
+
+    Default 0.05 (5 % IoU): roughly the magnitude of the per-footprint IoU
+    drop attributable to a 1 px registration error on a 30–60 m² rooftop at
+    0.5 m/px. Anything within this band of the unchanged threshold is in
+    "could go either way" territory and the pass treats it as unchanged
+    until proven otherwise.
+    """
+    return _float_env("CITYLENS_CHANGE_MODIFIED_BORDERLINE_MARGIN", 0.05)
+
+
+def _modified_borderline_require_surface_evidence() -> bool:
+    """Policy switch for the borderline-modified reclassification pass.
+
+    True (default): a borderline modified is reclassified to unchanged
+        UNLESS surface_changed=True confirms a real visual change. This is
+        the noise-reducing direction — what we want in production today
+        where the surface-change signal is dormant (no RGB baseline) and
+        any "modified" call near the unchanged threshold is presumptively
+        segmentation noise.
+
+    False: only reclassify when surface evidence is available AND it says
+        no change. This is the historically more permissive direction
+        (innocent until proven guilty); useful as an ablation toggle when
+        a real RGB 2017 baseline gets wired up and surface_changed becomes
+        a reliable signal.
+    """
+    return _bool_env(
+        "CITYLENS_CHANGE_MODIFIED_BORDERLINE_REQUIRE_SURFACE", True
+    )
 
 
 def _registration_max_shift_px() -> int:
@@ -726,11 +787,18 @@ def stage_change(
             else:
                 poly_list = []
 
-            # Surface-change check (#2). Only meaningful for unchanged
-            # features — modified/demolished already capture the change.
+            # Surface-change check (#2). Computed for `unchanged` features
+            # (catches re-roofing / repainting that shape-only IoU misses)
+            # AND for `modified` features (so the borderline-modified
+            # reclassification pass below can use surface_changed as a
+            # CONFIRMATION signal that a near-threshold IoU drop reflects a
+            # real visual change rather than segmentation noise).
             de_value: float | None = None
             surface_flag: bool | None = None
-            if change_type == "unchanged" and surface_images is not None:
+            if (
+                change_type in ("unchanged", "modified")
+                and surface_images is not None
+            ):
                 de_value = surface_delta_e(
                     images=surface_images,
                     footprint_mask=single_mask,
@@ -800,12 +868,17 @@ def stage_change(
                     lidar_ground_z=float(lidar_ground_z),
                     percentile=95.0,
                 )
-            # Surface-change check (#2) — same as per-source path, but
-            # only on unchanged components. Pixel-space-only fallback
-            # tiles probably won't have surface_images either.
+            # Surface-change check (#2) — same as per-source path, fires
+            # on both unchanged AND modified components so the borderline-
+            # modified reclassification pass below has Δ-E evidence to
+            # work with. Pixel-space-only fallback tiles probably won't
+            # have surface_images either.
             de_value: float | None = None
             surface_flag: bool | None = None
-            if change_type == "unchanged" and surface_images is not None:
+            if (
+                change_type in ("unchanged", "modified")
+                and surface_images is not None
+            ):
                 de_value = surface_delta_e(
                     images=surface_images,
                     footprint_mask=comp,
@@ -1007,6 +1080,100 @@ def stage_change(
             unchanged_thresh_used = adaptive
             summary.qa["change_counts"] = dict(counts)
     summary.qa["unchanged_iou_used"] = round(unchanged_thresh_used, 4)
+
+    # ------------------------------------------------------------------
+    # 4. Borderline-modified reclassification (two-stage classifier).
+    # ------------------------------------------------------------------
+    # PROBLEM (observed across Cooper Square, Hudson Yards, LIC Borden,
+    # Bedford-Williamsburg demos): the per-footprint IoU distribution
+    # bunches up just below the (post-adaptive) unchanged threshold —
+    # e.g. on Hudson Yards every one of the 11 "modified" features had
+    # IoU in [0.26, 0.37] with the threshold at 0.37. These are not real
+    # building modifications between 2017 and 2024; they're segmentation
+    # noise + sub-pixel registration drift parading as change.
+    #
+    # FIX: a feature classified as "modified" whose IoU sits within
+    # `borderline_margin` of the unchanged threshold is treated as a
+    # borderline call. It KEEPS its modified label only when surface_changed
+    # independently confirms a real visual change (Δ-E above threshold);
+    # otherwise it gets reclassified to "unchanged" with a low confidence
+    # and a `borderline_reclassified=True` provenance flag so the UI can
+    # render it differently / so operators can audit the decision.
+    #
+    # Like the adaptive-threshold pass above this only fires on tiles
+    # with enough baseline samples to trust the IoU statistics — single-
+    # feature unit tests retain their pre-margin behavior.
+    #
+    # Demolished and added are NOT touched — they're LiDAR-validated.
+    # Demolished→modified rescues (IoU < modified_thresh, downgraded) are
+    # also untouched: their IoU sits BELOW the band so the borderline-lo
+    # check excludes them by construction.
+    border_margin = _modified_borderline_margin()
+    border_strict = _modified_borderline_require_surface_evidence()
+    border_recls = {
+        "to_unchanged": 0,
+        "kept_by_surface_change": 0,
+        "kept_lenient_no_surface_signal": 0,
+    }
+    if (
+        border_margin > 0
+        and len(iou_samples) >= _adaptive_threshold_min_samples()
+        and unchanged_thresh_used > modified_thresh
+    ):
+        # Lower bound of the borderline band. Clamp so we never reach
+        # below modified_thresh (that's the demolished-rescue territory
+        # and shouldn't be touched by this pass).
+        border_lo = max(modified_thresh, unchanged_thresh_used - border_margin)
+        if border_lo + 1e-9 < unchanged_thresh_used:
+            for f in features:
+                props = f["properties"]
+                if props.get("change_type") != "modified":
+                    continue
+                iou = props.get("baseline_iou")
+                if iou is None or iou < border_lo:
+                    continue  # outside the borderline band
+
+                # surface_changed True = independent visual evidence of a
+                # real modification. Keep this feature as modified.
+                if props.get("surface_changed") is True:
+                    border_recls["kept_by_surface_change"] += 1
+                    continue
+
+                # No surface confirmation. Decide based on the policy:
+                #  - strict (default): reclassify to unchanged. The "drop
+                #    in IoU" is presumed to be noise.
+                #  - lenient: only reclassify when surface evidence was
+                #    AVAILABLE and explicitly said "no change" (i.e.,
+                #    surface_changed is False, not None). When the signal
+                #    is missing entirely (None), keep as modified.
+                surface_was_available = props.get("surface_changed") is False
+                if not border_strict and not surface_was_available:
+                    border_recls["kept_lenient_no_surface_signal"] += 1
+                    continue
+
+                counts["modified"] -= 1
+                counts["unchanged"] += 1
+                props["change_type"] = "unchanged"
+                # Penalize the confidence — this is a noisy borderline
+                # call, NOT a clean unchanged. Caps at 0.55 (just above
+                # the 0.5 lower bound of the modified-band confidence
+                # formula) so the frontend can render these faded.
+                if props.get("confidence") is not None:
+                    props["confidence"] = round(
+                        min(float(props["confidence"]), 0.55), 3
+                    )
+                else:
+                    props["confidence"] = 0.55
+                # Provenance flag: this feature didn't go through the
+                # normal "unchanged" gate; downstream consumers can
+                # distinguish it from a clean unchanged classification.
+                props["borderline_reclassified"] = True
+                border_recls["to_unchanged"] += 1
+    summary.qa["borderline_modified_reclassifications"] = dict(border_recls)
+    summary.qa["borderline_modified_margin"] = round(border_margin, 4)
+    # NOTE: `summary.qa["change_counts"] = dict(counts)` runs unconditionally
+    # below, so the reclassifications above are picked up regardless of
+    # whether border_recls["to_unchanged"] is positive.
 
     feature_collection = {"type": "FeatureCollection", "features": features}
     out_path.write_text(json.dumps(feature_collection, indent=2))

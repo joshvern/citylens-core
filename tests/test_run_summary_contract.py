@@ -38,6 +38,8 @@ def test_run_summary_includes_qa_and_performance_fields(tmp_path: Path, monkeypa
             "refined_mask": np.array([[1, 0], [0, 0]], dtype=np.uint8),
             "refined_baseline_mask": np.array([[1, 0], [0, 0]], dtype=np.uint8),
             "baseline_footprints_mask": np.array([[1, 0], [0, 0]], dtype=np.uint8),
+            "lidar_heights": np.array([[1.0, np.nan], [np.nan, np.nan]], dtype=np.float32),
+            "lidar_ground_z": 0.0,
         }
 
     def _stage_reconstruct(req, wd, ctx, summary):
@@ -63,7 +65,7 @@ def test_run_summary_includes_qa_and_performance_fields(tmp_path: Path, monkeypa
                 ]
             )
         )
-        return {**ctx, "mesh_path": mesh, "mesh_footprint_mask": np.array([[1, 0], [0, 0]], dtype=np.uint8), "mesh_height_source": "lidar"}
+        return {**ctx, "mesh_path": mesh, "mesh_footprint_mask": np.array([[1, 0], [0, 0]], dtype=np.uint8), "mesh_height_source": "mask"}
 
     def _stage_render(req, wd, ctx, summary):
         preview = Path(wd) / "preview.png"

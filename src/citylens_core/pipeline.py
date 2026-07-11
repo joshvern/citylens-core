@@ -232,7 +232,17 @@ def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -
             baseline_mask = ctx.get("refined_baseline_mask", ctx.get("baseline_mask"))
 
         summary.qa["baseline_footprints_used"] = bool(ctx.get("baseline_footprints_mask") is not None)
-        summary.qa["lidar_used"] = ctx.get("mesh_height_source") == "lidar"
+        # LiDAR is sampled during refine and also consumed by change
+        # classification, even when callers intentionally skip mesh output.
+        # Treat either contribution as real LiDAR use so change-only batch
+        # summaries do not falsely attest that LiDAR was ignored.
+        summary.qa["lidar_used"] = bool(
+            ctx.get("mesh_height_source") == "lidar"
+            or (
+                ctx.get("lidar_heights") is not None
+                and ctx.get("lidar_ground_z") is not None
+            )
+        )
 
         # Attest to the real input bytes used by this run. These let a reader
         # of run_summary.json answer "did this run actually use real imagery?"

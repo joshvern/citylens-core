@@ -13,6 +13,10 @@ def _default_qa() -> dict[str, Any]:
         "baseline_footprints_used": False,
         "lidar_used": False,
         "mask_iou": None,
+        # mask_xor_f1 is the honest name (mask-agreement signal, NOT change-
+        # classification accuracy — the reference is circular by construction);
+        # change_polygon_f1 is its deprecated alias, kept one release.
+        "mask_xor_f1": None,
         "change_polygon_f1": None,
         "mesh_footprint_iou": None,
         "parity_status": "not_evaluated",

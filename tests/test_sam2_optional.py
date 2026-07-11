@@ -5,10 +5,17 @@ from pathlib import Path
 import pytest
 
 
-def test_sam2_optional(tmp_path: Path) -> None:
+def test_sam2_optional(tmp_path: Path, monkeypatch) -> None:
     sam2_spec = importlib.util.find_spec("sam2")
     if sam2_spec is None:
         pytest.skip("sam2 not installed")
+
+    # Assets resolve against CITYLENS_ASSETS_ROOT (or cwd). Point at an empty
+    # dir so this test exercises the missing-weights failure path even on dev
+    # machines where `make sam2-assets` has populated the repo checkout.
+    empty_assets = tmp_path / "no-assets"
+    empty_assets.mkdir()
+    monkeypatch.setenv("CITYLENS_ASSETS_ROOT", str(empty_assets))
 
     from citylens_core import CitylensRequest, run_citylens
 

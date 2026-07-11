@@ -6,13 +6,15 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ..io.geo import binary_mask_stats
 from ..models import CitylensRequest, PipelineSummary
 from ._polygon_smoothing import (
     estimate_pixel_tolerance_in_world_units,
     simplify_polygon_coords,
 )
-from ._registration import apply_shift, estimate_alignment
+from ._registration import RegistrationResult, apply_shift, estimate_alignment
 from ._surface_change import (
+    _load_rgb,
     is_surface_changed,
     load_surface_images,
     surface_delta_e,
@@ -65,12 +67,15 @@ def _bool_env(name: str, default: bool) -> bool:
 
 
 def _min_area_m2() -> float:
-    """Drop change features smaller than this area in square meters.
+    """Drop 'added' components smaller than this area in square meters.
 
-    Default 100 m² (roughly one small garage/shed). Kills the sliver-noise
-    from imperfect mask alignment at building edges.
+    Default 60 m². History: the default was 100 m² while `_pixel_area_m2`
+    overstated EPSG:3857 areas by ~sec²(lat) (≈1.74× at NYC latitude), so the
+    gate actually fired at ~57 true-ground m². With areas now latitude-
+    corrected, 60 m² preserves that effective behavior AND keeps small NYC
+    infill rowhouses (~90-140 m² footprints) safely above the gate.
     """
-    return _float_env("CITYLENS_CHANGE_MIN_AREA_M2", 100.0)
+    return _float_env("CITYLENS_CHANGE_MIN_AREA_M2", 60.0)
 
 
 def _unchanged_iou() -> float:
@@ -275,20 +280,80 @@ def _added_max_baseline_overlap() -> float:
     return _float_env("CITYLENS_CHANGE_ADDED_MAX_BASELINE_OVERLAP", 0.1)
 
 
-def _added_min_height_m() -> float:
-    """LiDAR height gate on 'added' components.
+def _added_reject_border_touching() -> bool:
+    """Reject incomplete/noisy discovery components clipped by the tile.
 
-    A candidate new building must rise at least this many meters above the
-    ground plane. Kills the most common SAM2 false positives — trees,
-    hedges, vehicles, shadows, pavement patterns — without needing a
-    separate classifier. Default 2 m (shorter than a 1-story building,
-    taller than a van).
-
-    Only applied when the pipeline has a usable LiDAR heights grid.
-    Without LiDAR we don't have height information, so all candidate
-    components pass this gate (soft fail).
+    Automatic segmentation often emits one large road, water, or background
+    region connected to an image edge.  With baseline-epoch LiDAR that flat
+    region can otherwise look like strong evidence of new construction.
+    Border-clipped buildings are not reliable complete footprints either, so
+    the conservative production default is to reject them.  The switch keeps
+    controlled ablations possible.
     """
+    return _bool_env("CITYLENS_CHANGE_ADDED_REJECT_BORDER_TOUCHING", True)
+
+
+def _current_source_added_confidence() -> float:
+    """Confidence for a dated semantic footprint in baseline-empty space."""
+    return _float_env("CITYLENS_CHANGE_CURRENT_SOURCE_ADDED_CONFIDENCE", 0.9)
+
+
+def _current_source_modified_confidence() -> float:
+    """Confidence for a dated footprint overlapping/replacing a baseline."""
+    return _float_env("CITYLENS_CHANGE_CURRENT_SOURCE_MODIFIED_CONFIDENCE", 0.85)
+
+
+def _added_max_baseline_epoch_height_m() -> float:
+    """LiDAR height gate on 'added' components — BASELINE-EPOCH semantics.
+
+    The production LiDAR is baseline-epoch (2017 NYS TopoBathymetric) while
+    the imagery is current (2024). For a candidate new building that means:
+
+      - LiDAR ~ground level inside the component  →  the parcel was EMPTY at
+        the baseline epoch. Combined with a building-shaped 2024 SAM2 mask
+        (and the ExG vegetation reject), that is POSITIVE evidence of new
+        construction — accept as 'added' with boosted confidence.
+      - LiDAR tall inside the component  →  something already stood there at
+        the baseline epoch (tree canopy in first-return LiDAR, or a building
+        missing from the footprints GDB). NOT new construction — emit as
+        'candidate_added' for review rather than 'added'.
+
+    This is the inversion of the original gate, which assumed current-epoch
+    LiDAR and rejected flat components as "too short" — with 2017 LiDAR that
+    guaranteed rejecting exactly the new buildings the gate exists to find.
+
+    Value: a component whose baseline-epoch height-above-ground is BELOW this
+    threshold counts as "was flat". Default 2 m. The old env name
+    `CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M` is honored as a fallback for
+    existing deploys but its meaning is now "max baseline-epoch height".
+    """
+    raw = os.getenv("CITYLENS_CHANGE_ADDED_MAX_BASELINE_HEIGHT_M", "").strip()
+    if raw:
+        return _float_env("CITYLENS_CHANGE_ADDED_MAX_BASELINE_HEIGHT_M", 2.0)
     return _float_env("CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M", 2.0)
+
+
+def _added_exg_vegetation_threshold() -> float:
+    """Excess-green index (ExG = 2G − R − B on 0-255 RGB) above which an
+    'added' candidate is rejected as vegetation.
+
+    The baseline-epoch LiDAR gate can no longer reject trees by height in the
+    current epoch (2017 LiDAR says nothing about a tree that grew by 2024),
+    so vegetation discrimination moves to the imagery itself: healthy canopy
+    has strongly positive ExG, roofs (gray/black/brown/white) sit near or
+    below zero. Median ExG over the component keeps single green pixels from
+    dominating. Default 30.0 — comfortably above roofing materials, below
+    healthy foliage. Set <= 0 to disable. Only applies when the orthophoto
+    RGB is loadable at mask shape."""
+    return _float_env("CITYLENS_CHANGE_ADDED_EXG_VEG_THRESHOLD", 30.0)
+
+
+def _added_strong_confidence() -> float:
+    """Confidence for 'added' components confirmed by the baseline-epoch
+    LiDAR gate (parcel was flat at baseline epoch + building-shaped now +
+    not vegetation). Two independent signals agree, so this sits above the
+    generic added confidence (0.7)."""
+    return _float_env("CITYLENS_CHANGE_ADDED_STRONG_CONFIDENCE", 0.85)
 
 
 def _added_height_percentile() -> float:
@@ -343,21 +408,41 @@ def _added_max_inside_dilation_frac() -> float:
 
 
 def _demolished_max_height_m() -> float:
-    """LiDAR-validated demolished gate.
+    """LiDAR-validated demolished-rescue threshold (see
+    `_demolished_rescue_lidar_epoch` for when the rescue applies at all).
 
-    The current rule labels a baseline footprint as "demolished" whenever
-    SAM2 IoU < modified_iou (0.2 by default). But SAM2 sometimes misses
-    buildings entirely — dark roofs on shadowed imagery come out IoU≈0 and
-    get wrongly labeled demolished. If LiDAR shows a real structure
-    standing inside the baseline footprint (75th-percentile height above
-    ground exceeds this threshold), downgrade the classification from
-    "demolished" → "modified" — the SAM2 mask is unreliable but LiDAR
-    confirms a building is still there.
+    When the rescue is active and LiDAR shows a structure standing inside a
+    baseline footprint (75th-percentile height above ground exceeds this),
+    a would-be "demolished" call is downgraded to "modified" — SAM2 missed
+    the building (dark roof, shadow) but LiDAR confirms it's there.
 
     Default 3.0 m: taller than a parked truck or hedge, shorter than every
     real one-story building.
     """
     return _float_env("CITYLENS_CHANGE_DEMOLISHED_MAX_HEIGHT_M", 3.0)
+
+
+def _demolished_rescue_lidar_epoch() -> str:
+    """Which acquisition epoch the LiDAR grid belongs to, for the
+    demolished→modified rescue. One of:
+
+      - "baseline" (default): LiDAR is contemporaneous with the BASELINE
+        (production reality: 2017 NYS TopoBathymetric vs 2024 imagery). A
+        standing structure in baseline-epoch LiDAR is EXPECTED for a real
+        2017→2024 demolition — the old building was there in 2017 whether or
+        not it was demolished later — so the rescue has zero discriminative
+        power and is DISABLED. (Previously it ran anyway and downgraded
+        essentially every genuine demolition to "modified".)
+      - "current": LiDAR is contemporaneous with the CURRENT imagery. A
+        standing structure genuinely contradicts "demolished", so the
+        original rescue applies.
+
+    Known trade-off under "baseline": SAM2 dark-roof misses can surface as
+    false "demolished" calls again; those carry their IoU-derived confidence
+    and remain auditable.
+    """
+    raw = os.getenv("CITYLENS_CHANGE_DEMOLISHED_RESCUE_LIDAR_EPOCH", "").strip().lower()
+    return raw if raw in ("baseline", "current") else "baseline"
 
 
 def _demolished_height_percentile() -> float:
@@ -417,6 +502,21 @@ def _label_components(mask: Any) -> tuple[Any, int]:
     return labels, n
 
 
+def _mask_touches_border(mask: Any) -> bool:
+    """Whether any True pixel lies on the image boundary."""
+    import numpy as np
+
+    m = np.asarray(mask).astype(bool)
+    if m.ndim != 2 or not m.any():
+        return False
+    return bool(
+        m[0, :].any()
+        or m[-1, :].any()
+        or m[:, 0].any()
+        or m[:, -1].any()
+    )
+
+
 def _polygon_coords_from_pixel_mask(
     pixel_mask: Any, *, transform: Any | None
 ) -> list[list[list[list[float]]]]:
@@ -459,7 +559,17 @@ def _polygon_coords_from_pixel_mask(
 
 def _pixel_area_m2(transform: Any | None, crs_value: str | None) -> float:
     """Return the area of one pixel in square meters, or 0 when we can't
-    confidently convert (e.g. pixel-space only or unknown CRS)."""
+    confidently convert (e.g. pixel-space only or unknown CRS).
+
+    Web-Mercator (EPSG:3857) "meters" are not ground meters: the map scale
+    is sec(lat), so a naive a*e product overstates ground area by sec²(lat)
+    — ~1.74× at NYC's 40.7°N. We derive the latitude from the transform's
+    y-origin and correct by cos²(lat). Every consumer of `area_m2` (the
+    min-area gate, the published change features, the parcel-intel moat)
+    depends on this being true ground area.
+    """
+    import math
+
     if transform is None:
         return 0.0
     try:
@@ -470,22 +580,30 @@ def _pixel_area_m2(transform: Any | None, crs_value: str | None) -> float:
     if not px:
         return 0.0
     s = (crs_value or "").strip().lower()
-    # EPSG:3857 has units of meters but scale varies with latitude
-    # (the pixel width stored in `a` is already in the projected meters
-    # used by rasterio, so px is already m²). For projected CRS in feet,
-    # convert.
     if s in ("pixel", ""):
         return 0.0
-    if "ftus" in s or "ft" in s.replace("-", "").replace("_", "") and "meter" not in s:
-        # 1 US survey foot = 0.3048006096... m, so 1 ft² ≈ 0.09290341 m²
+    cleaned = s.replace("-", "").replace("_", "")
+    if ("ftus" in cleaned or "2263" in cleaned or cleaned.endswith("ft")) and "meter" not in s:
+        # NY State Plane (EPSG:2263) & friends: US survey feet.
+        # 1 ft² ≈ 0.09290341 m². State Plane scale error is <0.01% — no
+        # latitude correction needed.
         return px * 0.0929034116
+    if "3857" in cleaned or "pseudomercator" in cleaned or "webmercator" in cleaned:
+        try:
+            # Invert the spherical-Mercator y of the raster's top edge to
+            # latitude: lat = atan(sinh(y / R)). Top-vs-center differs by
+            # <0.005° over a 512 m AOI — negligible for cos².
+            lat = math.atan(math.sinh(float(transform.f) / 6378137.0))
+            return px * math.cos(lat) ** 2
+        except Exception:
+            return px
     return px
 
 
 def _feature(
     *,
     change_type: str,
-    coordinates: list[list[list[float]]],
+    coordinates: Any,
     area_m2: float | None,
     baseline_iou: float | None,
     imagery_year: int,
@@ -496,6 +614,7 @@ def _feature(
     confidence: float | None = None,
     surface_delta_e_value: float | None = None,
     surface_changed: bool | None = None,
+    geometry_type: str = "Polygon",
 ) -> dict[str, Any]:
     props: dict[str, Any] = {
         "change_type": change_type,
@@ -534,7 +653,7 @@ def _feature(
     return {
         "type": "Feature",
         "properties": props,
-        "geometry": {"type": "Polygon", "coordinates": coordinates},
+        "geometry": {"type": geometry_type, "coordinates": coordinates},
     }
 
 
@@ -543,10 +662,14 @@ def _feature(
 # ----------------------------------------------------------------------
 
 
-def _load_baseline_source_features(work_dir: Path) -> list[dict[str, Any]] | None:
-    """Load baseline_footprints.geojson features when the worker materialized
-    one. Returns None when the file doesn't exist (tests, non-NYC paths)."""
-    gj_path = work_dir / "baseline_footprints.geojson"
+def _load_source_features(path: Path) -> list[dict[str, Any]] | None:
+    """Load a local GeoJSON FeatureCollection without any external I/O.
+
+    ``None`` means absent/invalid and enables the caller's fallback. A valid
+    empty collection returns ``[]`` because an authoritative source may
+    intentionally attest that no buildings exist in the AOI.
+    """
+    gj_path = Path(path)
     if not gj_path.exists():
         return None
     try:
@@ -555,10 +678,22 @@ def _load_baseline_source_features(work_dir: Path) -> list[dict[str, Any]] | Non
         return None
     if not isinstance(payload, dict):
         return None
+    if payload.get("type") != "FeatureCollection":
+        return None
     feats = payload.get("features")
     if not isinstance(feats, list):
         return None
     return [f for f in feats if isinstance(f, dict) and f.get("geometry")]
+
+
+def _load_baseline_source_features(work_dir: Path) -> list[dict[str, Any]] | None:
+    """Load staged baseline building features when available."""
+    return _load_source_features(work_dir / "baseline_footprints.geojson")
+
+
+def _load_current_source_features(work_dir: Path) -> list[dict[str, Any]] | None:
+    """Load optional semantic current buildings from the local work dir."""
+    return _load_source_features(work_dir / "current_footprints.geojson")
 
 
 def _rasterize_single_geom(
@@ -598,6 +733,120 @@ def _extract_source_provenance(source_props: Any) -> dict[str, Any]:
         return {}
     keep = ("source_gdb", "source_layer", "Source", "SourceDate", "NYSGeo_Source")
     return {k: source_props[k] for k in keep if k in source_props}
+
+
+def _construction_year(source_props: Any) -> int | None:
+    """Normalize a source construction year, rejecting bools/junk."""
+    if not isinstance(source_props, dict):
+        return None
+    raw = source_props.get("construction_year")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        year = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
+    return year if 1000 <= year <= 9999 else None
+
+
+def _extract_current_source_provenance(source_props: Any) -> dict[str, Any]:
+    """Forward the stable semantic-current-footprint provenance contract."""
+    if not isinstance(source_props, dict):
+        return {"current_footprint_semantic": True}
+    keep = (
+        "last_status_type",
+        "geom_source",
+        "base_bbl",
+        "mappluto_bbl",
+        "source_dataset",
+    )
+    out = {k: source_props[k] for k in keep if k in source_props}
+    year = _construction_year(source_props)
+    if year is not None:
+        out["construction_year"] = year
+    out["current_footprint_semantic"] = True
+    return out
+
+
+def _best_local_iou(
+    im: Any,
+    fp_roi: Any,
+    *,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    max_shift: int = 2,
+    min_gain: float = 0.02,
+) -> tuple[float, tuple[int, int] | None]:
+    """Per-footprint local registration refinement.
+
+    The single global phase-correlation shift is dominated by the largest
+    footprints in the tile; small buildings can carry a residual local
+    misalignment that reads as a spurious IoU drop (false "modified"). Slide
+    the IMAGERY window ±`max_shift` px around the footprint's ROI and take
+    the best IoU — adopted only when it beats the unshifted IoU by
+    `min_gain`, so noise can't inflate scores.
+
+    Implementation note: slides the imagery *window* (O(ROI px) per shift,
+    ~5e7 boolean ops for 200 footprints at ±2) — never roll the full-tile
+    mask, which is ~100× more work.
+
+    Returns (iou, (dy, dx) or None when the unshifted IoU stands).
+    """
+    import numpy as np
+
+    h, w = im.shape
+    fp = np.asarray(fp_roi)
+    fp_any = bool(fp.any())
+
+    def _iou_at(u: int, v: int) -> float:
+        sy0, sy1 = y0 + u, y1 + u
+        sx0, sx1 = x0 + v, x1 + v
+        # Clamp the shifted window to the image; keep the footprint ROI
+        # aligned by trimming the same rows/cols.
+        ty0, ty1 = max(sy0, 0), min(sy1, h)
+        tx0, tx1 = max(sx0, 0), min(sx1, w)
+        if ty0 >= ty1 or tx0 >= tx1:
+            return 0.0
+        im_win = im[ty0:ty1, tx0:tx1]
+        fp_win = fp[ty0 - sy0 : (ty1 - sy0), tx0 - sx0 : (tx1 - sx0)]
+        inter = int(np.logical_and(fp_win, im_win).sum())
+        union = int(np.logical_or(fp_win, im_win).sum())
+        return float(inter) / float(union) if union > 0 else 0.0
+
+    base_iou = _iou_at(0, 0)
+    if not fp_any or max_shift <= 0:
+        return base_iou, None
+
+    best_iou = base_iou
+    best_shift: tuple[int, int] | None = None
+    for u in range(-max_shift, max_shift + 1):
+        for v in range(-max_shift, max_shift + 1):
+            if u == 0 and v == 0:
+                continue
+            iou = _iou_at(u, v)
+            if iou > best_iou:
+                best_iou = iou
+                best_shift = (u, v)
+
+    if best_shift is not None and best_iou >= base_iou + min_gain:
+        return best_iou, best_shift
+    return base_iou, None
+
+
+def _local_registration_max_shift_px() -> int:
+    """Per-footprint local refinement window (± this many px) applied on top
+    of the global registration shift. 0 disables. Default 2 — the residual
+    after the ±4 px global correction is sub-3 px in observed NYS data."""
+    return _int_env("CITYLENS_CHANGE_LOCAL_REGISTRATION_MAX_SHIFT_PX", 2)
+
+
+def _local_registration_min_iou_gain() -> float:
+    """Minimum IoU improvement over the unshifted score before a local
+    per-footprint shift is adopted. Guards against max-over-shifts noise
+    inflation masking small real modifications."""
+    return _float_env("CITYLENS_CHANGE_LOCAL_REGISTRATION_MIN_IOU_GAIN", 0.02)
 
 
 # ----------------------------------------------------------------------
@@ -647,6 +896,64 @@ def stage_change(
     im = np.asarray(imagery_mask).astype(bool)
     base = np.asarray(baseline_mask).astype(bool)
 
+    # A staged current-footprint FeatureCollection is the preferred semantic
+    # source for "does a building exist now?" It is already in the ortho CRS.
+    # Keep `im` as the SAM mask for pipeline QA/preview consumers, but classify
+    # baseline presence against this vector-derived mask when available.
+    current_source_features = _load_current_source_features(work_dir)
+    current_footprints_mask = ctx.get("current_footprints_mask")
+    if (
+        current_footprints_mask is None
+        and current_source_features is not None
+        and transform is not None
+    ):
+        current_union = np.zeros_like(im, dtype=bool)
+        for current_feature in current_source_features:
+            current_union |= _rasterize_single_geom(
+                current_feature.get("geometry"),
+                out_shape=im.shape,
+                transform=transform,
+            )
+        current_footprints_mask = current_union
+
+    if current_footprints_mask is not None:
+        current_presence = np.asarray(current_footprints_mask).astype(bool)
+        if current_presence.shape != im.shape:
+            raise RuntimeError(
+                "current footprints mask shape "
+                f"{current_presence.shape} does not match imagery mask {im.shape}"
+            )
+        classification_im = current_presence
+        summary.qa["current_footprints_used"] = True
+        summary.qa["current_presence_source"] = "current_footprints"
+        summary.qa["current_footprints_mask"] = binary_mask_stats(current_presence)
+    else:
+        classification_im = im
+        summary.qa["current_footprints_used"] = False
+        summary.qa["current_presence_source"] = "sam2"
+    summary.qa["current_footprint_feature_count"] = (
+        len(current_source_features) if current_source_features is not None else 0
+    )
+
+    # This discovery mask is separate from baseline-presence classification:
+    # semantic current footprints (preferred) or prompted SAM drive existing
+    # footprints, while AMG is only a generic-added fallback. Auto mode aliases
+    # its primary mask here without paying for duplicate automatic inference.
+    discovery_mask = ctx.get("refined_added_discovery_mask")
+    added_mask_source = "refined_added_discovery_mask"
+    if discovery_mask is None:
+        discovery_mask = ctx.get("added_discovery_mask")
+        added_mask_source = "added_discovery_mask"
+    if discovery_mask is None:
+        discovery_mask = imagery_mask
+        added_mask_source = "imagery_mask"
+    added_im = np.asarray(discovery_mask).astype(bool)
+    if added_im.shape != im.shape:
+        raise RuntimeError(
+            f"discovery mask shape {added_im.shape} does not match imagery mask {im.shape}"
+        )
+    summary.qa["added_mask_source"] = added_mask_source
+
     # ------------------------------------------------------------------
     # Sub-pixel registration (#1). Estimate one global (dy, dx) shift
     # that aligns the baseline mask to the current mask. Recovers the
@@ -655,13 +962,32 @@ def stage_change(
     # If the phase-correlation peak isn't confident enough or the IoU
     # gain is trivial, the shift is NOT applied — defensive default.
     # ------------------------------------------------------------------
-    registration = estimate_alignment(
-        base,
-        im,
-        max_shift_px=_registration_max_shift_px(),
-        min_confidence=_registration_min_confidence(),
-        min_iou_gain=_registration_min_iou_gain(),
-    )
+    if current_footprints_mask is not None:
+        # Both semantic layers are already on the orthophoto grid. Preserve
+        # source geometry exactly and avoid an unnecessary full-tile FFT.
+        semantic_intersection = int(np.logical_and(base, classification_im).sum())
+        semantic_union = int(np.logical_or(base, classification_im).sum())
+        semantic_iou = (
+            float(semantic_intersection) / float(semantic_union)
+            if semantic_union
+            else 1.0
+        )
+        registration = RegistrationResult(
+            dy=0.0,
+            dx=0.0,
+            confidence=1.0,
+            iou_before=semantic_iou,
+            iou_after=semantic_iou,
+            accepted=False,
+        )
+    else:
+        registration = estimate_alignment(
+            base,
+            classification_im,
+            max_shift_px=_registration_max_shift_px(),
+            min_confidence=_registration_min_confidence(),
+            min_iou_gain=_registration_min_iou_gain(),
+        )
     summary.qa["registration"] = {
         "dy": registration.dy,
         "dx": registration.dx,
@@ -669,6 +995,18 @@ def stage_change(
         "iou_before": round(registration.iou_before, 4),
         "iou_after": round(registration.iou_after, 4),
         "applied": bool(registration.accepted),
+        "mode": (
+            "semantic_exact"
+            if current_footprints_mask is not None
+            else "image_registration"
+        ),
+        # True when the estimated shift hit the ± cap — the real
+        # misregistration may be larger than what was corrected; expect
+        # residual false 'modified' on such tiles.
+        "saturated": bool(
+            max(abs(registration.dy), abs(registration.dx))
+            >= _registration_max_shift_px()
+        ),
     }
     if registration.accepted:
         base = apply_shift(base, dy=registration.dy, dx=registration.dx)
@@ -705,6 +1043,96 @@ def stage_change(
     features: list[dict[str, Any]] = []
     counts = {"unchanged": 0, "modified": 0, "demolished": 0, "added": 0}
 
+    # Dated semantic current footprints are direct change evidence. Build the
+    # event records before baseline classification so a replacement can
+    # suppress the stale baseline output it supersedes (avoids emitting both
+    # "unchanged old footprint" and "modified replacement" on one building).
+    semantic_current_events: list[dict[str, Any]] = []
+    semantic_current_rejected = {"too_small": 0, "border_touching": 0}
+    semantic_modified_mask = np.zeros_like(base, dtype=bool)
+    semantic_current_usable = bool(
+        current_source_features is not None
+        and current_footprints_mask is not None
+        and transform is not None
+    )
+    generic_added_fallback_used = not semantic_current_usable
+    if semantic_current_usable:
+        added_mask_source = "current_footprints"
+        summary.qa["added_mask_source"] = added_mask_source
+    summary.qa["generic_added_fallback_used"] = generic_added_fallback_used
+    if semantic_current_usable:
+        for current_feature in current_source_features:
+            current_props = current_feature.get("properties")
+            construction_year = _construction_year(current_props)
+            if (
+                construction_year is None
+                or construction_year <= request.baseline_year
+                or construction_year > request.imagery_year
+            ):
+                continue
+            current_geom = current_feature.get("geometry")
+            if not isinstance(current_geom, dict):
+                continue
+            geometry_type = str(current_geom.get("type", "")).strip()
+            coordinates = current_geom.get("coordinates")
+            if geometry_type not in ("Polygon", "MultiPolygon") or not coordinates:
+                continue
+            current_mask = _rasterize_single_geom(
+                current_geom,
+                out_shape=base.shape,
+                transform=transform,
+            )
+            current_area_px = int(current_mask.sum())
+            if current_area_px < 1:
+                continue
+            if _mask_touches_border(current_mask):
+                # Even with padded source queries, an edge-clipped geometry
+                # is incomplete evidence for a change claim.
+                semantic_current_rejected["border_touching"] += 1
+                continue
+            if current_area_px < min_area_px:
+                # Apply the same commercial noise floor as generic added
+                # components before this event can suppress a baseline row.
+                semantic_current_rejected["too_small"] += 1
+                continue
+            baseline_overlap_px = int(np.logical_and(current_mask, base).sum())
+            baseline_overlap_fraction = (
+                float(baseline_overlap_px) / float(current_area_px)
+            )
+            semantic_change_type = (
+                "added"
+                if baseline_overlap_fraction <= added_overlap_cap
+                else "modified"
+            )
+            if semantic_change_type == "modified":
+                semantic_modified_mask |= current_mask
+            semantic_current_events.append(
+                {
+                    "change_type": semantic_change_type,
+                    "area_px": current_area_px,
+                    "baseline_overlap_fraction": baseline_overlap_fraction,
+                    "geometry_type": geometry_type,
+                    "coordinates": coordinates,
+                    "properties": current_props,
+                }
+            )
+
+    semantic_baseline_outputs_suppressed = 0
+    baseline_edge_changes_skipped = {"modified": 0, "demolished": 0}
+
+    def _superseded_by_semantic_current(footprint_mask: Any) -> bool:
+        """Whether a dated replacement materially covers this baseline."""
+        if not semantic_modified_mask.any():
+            return False
+        fp = np.asarray(footprint_mask).astype(bool)
+        fp_area = int(fp.sum())
+        if fp_area < 1:
+            return False
+        overlap = int(np.logical_and(fp, semantic_modified_mask).sum())
+        return overlap > 0 and (
+            float(overlap) / float(fp_area)
+        ) >= added_overlap_cap
+
     # LiDAR-validated demolished rescue. Pulled up here so both the
     # per-source-feature path and the legacy component-labeled fallback can
     # use it. `None` ⇒ no LiDAR available, rescue disabled (legacy
@@ -713,20 +1141,27 @@ def stage_change(
     lidar_ground_z = ctx.get("lidar_ground_z")
     demolished_max_h = _demolished_max_height_m()
     demolished_pctl = _demolished_height_percentile()
+    # Epoch gate: with baseline-epoch LiDAR (production: 2017 grid vs 2024
+    # imagery) a standing structure is EXPECTED for a genuine demolition, so
+    # the rescue carries no signal and previously converted essentially every
+    # real demolition into "modified". Only rescue with current-epoch LiDAR.
+    demolished_rescue_enabled = _demolished_rescue_lidar_epoch() == "current"
     summary.qa.setdefault("demolished_downgraded_to_modified", 0)
+    summary.qa["demolished_rescue_lidar_epoch"] = _demolished_rescue_lidar_epoch()
 
     def _classify_with_lidar_rescue(iou: float, footprint_mask) -> str:
-        """Apply IoU bands, then downgrade demolished→modified if LiDAR
-        shows a real structure standing inside the baseline footprint."""
+        """Apply IoU bands, then (current-epoch LiDAR only) downgrade
+        demolished→modified if LiDAR shows a structure still standing
+        inside the baseline footprint."""
         if iou >= unchanged_thresh:
             return "unchanged"
         if iou >= modified_thresh:
             return "modified"
-        # IoU < modified_thresh — would normally be 'demolished'. Try LiDAR
-        # rescue: if the 75th-pct height above ground is more than
-        # `demolished_max_h` meters, SAM2 likely missed the building (dark
-        # roof, shadow), so downgrade to 'modified' instead of demolished.
-        if lidar_heights is not None and lidar_ground_z is not None:
+        if (
+            demolished_rescue_enabled
+            and lidar_heights is not None
+            and lidar_ground_z is not None
+        ):
             h_above = _lidar_height_at_mask(
                 mask=footprint_mask,
                 lidar_heights=lidar_heights,
@@ -747,9 +1182,17 @@ def stage_change(
     # to component-labeling the rasterized baseline mask.
     source_features = _load_baseline_source_features(work_dir)
 
+    local_reg_max_shift = (
+        0
+        if current_footprints_mask is not None
+        else _local_registration_max_shift_px()
+    )
+    local_reg_min_gain = _local_registration_min_iou_gain()
+    local_reg_applied = 0
+
     if source_features is not None and not pixel_space_only:
         summary.qa["change_source"] = "per_source_feature"
-        h, w = im.shape
+        h, w = classification_im.shape
         for src_feat in source_features:
             geom = src_feat.get("geometry")
             if not geom:
@@ -769,9 +1212,15 @@ def stage_change(
             )
             if not scoring_mask.any():
                 scoring_mask = single_mask
+            if _superseded_by_semantic_current(scoring_mask):
+                semantic_baseline_outputs_suppressed += 1
+                continue
 
             # IoU measured within the footprint's bbox (pad 10%) so a
-            # single large SAM2 blob can't swallow every neighbor.
+            # single large SAM2 blob can't swallow every neighbor. On top of
+            # the global shift, a small per-footprint refinement recovers
+            # residual local misalignment (the global shift is dominated by
+            # the largest buildings and can leave small footprints offset).
             ys, xs = np.where(scoring_mask)
             y0, y1 = int(ys.min()), int(ys.max()) + 1
             x0, x1 = int(xs.min()), int(xs.max()) + 1
@@ -782,16 +1231,33 @@ def stage_change(
             y1 = min(h, y1 + pad_y)
             x1 = min(w, x1 + pad_x)
             fp_roi = scoring_mask[y0:y1, x0:x1]
-            im_roi = im[y0:y1, x0:x1]
-            inter = int(np.logical_and(fp_roi, im_roi).sum())
-            union = int(np.logical_or(fp_roi, im_roi).sum())
-            iou = float(inter) / float(union) if union > 0 else 0.0
+            iou, local_shift = _best_local_iou(
+                classification_im,
+                fp_roi,
+                y0=y0,
+                y1=y1,
+                x0=x0,
+                x1=x1,
+                max_shift=local_reg_max_shift,
+                min_gain=local_reg_min_gain,
+            )
+            if local_shift is not None:
+                local_reg_applied += 1
 
             change_type = _classify_with_lidar_rescue(iou, scoring_mask)
+            if change_type in baseline_edge_changes_skipped and _mask_touches_border(
+                scoring_mask
+            ):
+                baseline_edge_changes_skipped[change_type] += 1
+                continue
             counts[change_type] += 1
 
             area_m2_val = float(single_area_px) * px_area_m2 if px_area_m2 > 0 else None
             provenance = _extract_source_provenance(src_feat.get("properties"))
+            if local_shift is not None:
+                # Audit trail: this footprint's IoU came from a locally
+                # refined alignment, not the raw global registration.
+                provenance = {**provenance, "local_shift_px": list(local_shift)}
             # Sample 95th-pct LiDAR height inside the footprint so each output
             # feature carries its own building height. Reused by UIs and by
             # the LOD1 mesh stage. None when LiDAR isn't available.
@@ -868,6 +1334,9 @@ def stage_change(
             comp_area_px = int(comp.sum())
             if comp_area_px < 1:
                 continue
+            if _superseded_by_semantic_current(comp):
+                semantic_baseline_outputs_suppressed += 1
+                continue
 
             ys, xs = np.where(comp)
             y0, y1 = int(ys.min()), int(ys.max()) + 1
@@ -880,12 +1349,25 @@ def stage_change(
             x1 = min(comp.shape[1], x1 + pad_x)
 
             comp_roi = comp[y0:y1, x0:x1]
-            im_roi = im[y0:y1, x0:x1]
-            inter = int(np.logical_and(comp_roi, im_roi).sum())
-            union = int(np.logical_or(comp_roi, im_roi).sum())
-            iou = float(inter) / float(union) if union > 0 else 0.0
+            iou, local_shift = _best_local_iou(
+                classification_im,
+                comp_roi,
+                y0=y0,
+                y1=y1,
+                x0=x0,
+                x1=x1,
+                max_shift=local_reg_max_shift,
+                min_gain=local_reg_min_gain,
+            )
+            if local_shift is not None:
+                local_reg_applied += 1
 
             change_type = _classify_with_lidar_rescue(iou, comp)
+            if change_type in baseline_edge_changes_skipped and _mask_touches_border(
+                comp
+            ):
+                baseline_edge_changes_skipped[change_type] += 1
+                continue
             counts[change_type] += 1
 
             area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
@@ -942,21 +1424,92 @@ def stage_change(
                 )
 
     # ------------------------------------------------------------------
-    # 2. Find "added" buildings — components in imagery that don't overlap
-    #    any baseline footprint.
+    # 2. Emit dated semantic current-footprint events.
     # ------------------------------------------------------------------
-    added_min_height_m = _added_min_height_m()
+    semantic_current_counts = {"added": 0, "modified": 0}
+    for semantic_event in semantic_current_events:
+        semantic_change_type = str(semantic_event["change_type"])
+        semantic_current_counts[semantic_change_type] += 1
+        counts[semantic_change_type] += 1
+        semantic_area_m2 = (
+            float(semantic_event["area_px"]) * px_area_m2
+            if px_area_m2 > 0
+            else None
+        )
+        semantic_props = _extract_current_source_provenance(
+            semantic_event.get("properties")
+        )
+        semantic_props.update(
+            {
+                "baseline_overlap_fraction": round(
+                    float(semantic_event["baseline_overlap_fraction"]), 4
+                ),
+                "semantic_change_basis": "construction_year",
+            }
+        )
+        semantic_confidence = (
+            _current_source_added_confidence()
+            if semantic_change_type == "added"
+            else _current_source_modified_confidence()
+        )
+        # Preserve one source feature as one event. In particular, a
+        # MultiPolygon keeps one total area and increments counts once rather
+        # than emitting N Polygon rows that each claim the whole-feature area.
+        features.append(
+            _feature(
+                change_type=semantic_change_type,
+                coordinates=semantic_event["coordinates"],
+                area_m2=semantic_area_m2,
+                baseline_iou=None,
+                imagery_year=request.imagery_year,
+                baseline_year=request.baseline_year,
+                crs_value=crs_value,
+                extra_props=semantic_props,
+                confidence=semantic_confidence,
+                geometry_type=str(semantic_event["geometry_type"]),
+            )
+        )
+    summary.qa["semantic_current_change_counts"] = semantic_current_counts
+    summary.qa["semantic_current_rejected"] = semantic_current_rejected
+    summary.qa["semantic_baseline_outputs_suppressed"] = int(
+        semantic_baseline_outputs_suppressed
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Generic added fallback — automatic/prompted components that don't
+    #    overlap a baseline. A usable semantic current collection is complete
+    #    for the AOI and disables this noisier lane, preventing duplicates.
+    # ------------------------------------------------------------------
+    added_max_baseline_h = _added_max_baseline_epoch_height_m()
     added_height_pctl = _added_height_percentile()
     added_baseline_dilate_px = _added_baseline_dilate_px()
     added_max_inside_dilation_frac = _added_max_inside_dilation_frac()
+    added_exg_threshold = _added_exg_vegetation_threshold()
+    reject_border_touching = (
+        _added_reject_border_touching() and added_mask_source != "imagery_mask"
+    )
     added_reject_reasons = {
         "too_small": 0,
+        "border_touching": 0,
         "baseline_overlap": 0,
         "centroid_near_baseline": 0,
         "majority_inside_baseline_dilation": 0,
-        "too_short": 0,
+        "vegetation": 0,
+        "preexisting_structure_emitted_as_candidate": 0,
         "no_lidar_coverage_emitted_as_candidate": 0,
     }
+
+    # Orthophoto RGB for the ExG vegetation reject. Loaded directly (NOT via
+    # `surface_images`, which is None whenever the baseline is a one-band
+    # footprint mask — the production configuration). Soft-skips when the
+    # ortho path is absent or the shape mismatches (unit-test fixtures).
+    ortho_rgb = None
+    if generic_added_fallback_used and added_exg_threshold > 0:
+        _ortho_path = ctx.get("orthophoto_path")
+        if _ortho_path is not None:
+            _rgb = _load_rgb(Path(_ortho_path))
+            if _rgb is not None and _rgb.shape[:2] == im.shape:
+                ortho_rgb = _rgb
 
     # Pre-compute the wide baseline dilation used by the courtyard /
     # centroid-near-baseline filter. Built once outside the per-component
@@ -964,17 +1517,28 @@ def stage_change(
     # times.
     baseline_dilated_wide = (
         _n_step_dilate(base, added_baseline_dilate_px)
-        if added_baseline_dilate_px > 0
+        if generic_added_fallback_used and added_baseline_dilate_px > 0
         else None
     )
 
-    added_pixels = np.logical_and(im, np.logical_not(base))
+    added_pixels = (
+        np.logical_and(added_im, np.logical_not(base))
+        if generic_added_fallback_used
+        else np.zeros_like(base, dtype=bool)
+    )
     added_labels, added_n = _label_components(added_pixels)
     for comp_id in range(1, added_n + 1):
         comp = added_labels == comp_id
         comp_area_px = int(comp.sum())
         if comp_area_px < min_area_px:
             added_reject_reasons["too_small"] += 1
+            continue
+
+        # AMG commonly yields a huge road/background region connected to the
+        # tile edge.  It is both an obvious false building and an incomplete
+        # polygon, so reject it before the more expensive per-component gates.
+        if reject_border_touching and _mask_touches_border(comp):
+            added_reject_reasons["border_touching"] += 1
             continue
 
         # Reject slivers along existing baseline buildings.
@@ -1020,11 +1584,34 @@ def stage_change(
                     added_reject_reasons["majority_inside_baseline_dilation"] += 1
                     continue
 
-        # Reject things SAM2 thinks are buildings but which LiDAR says are
-        # short — trees, hedges, vehicles, pavement patterns. Only gated
-        # when we have LiDAR + a ground-plane estimate.
+        # Vegetation reject on the imagery itself. The LiDAR gate below is
+        # BASELINE-epoch (2017) and therefore says nothing about a tree that
+        # grew or leafed out by the current epoch — ExG on the 2024 RGB is
+        # the discriminator: healthy canopy is strongly green-excess, roofs
+        # are not. Median over the component resists mixed pixels.
+        if ortho_rgb is not None:
+            comp_px = ortho_rgb[comp]
+            if comp_px.size:
+                px_f = comp_px.astype("float64")
+                exg = float(
+                    np.median(2.0 * px_f[:, 1] - px_f[:, 0] - px_f[:, 2])
+                )
+                if exg >= added_exg_threshold:
+                    added_reject_reasons["vegetation"] += 1
+                    continue
+
+        # Baseline-EPOCH LiDAR gate (see _added_max_baseline_epoch_height_m):
+        # the LiDAR grid is contemporaneous with the BASELINE (2017), so
+        #   flat then + building-shaped now  →  built since baseline: strong
+        #                                       'added' (two signals agree);
+        #   tall then                       →  something already stood there
+        #                                       (canopy / GDB-missing bldg):
+        #                                       demote to 'candidate_added';
+        #   no coverage                     →  'candidate_added' (unknown).
         added_height_above_ground_m: float | None = None
-        emit_as_candidate = False  # #5: True iff LiDAR has no coverage for this comp.
+        emit_as_candidate = False
+        candidate_reason: str | None = None
+        strong_added = False
         if lidar_heights is not None and lidar_ground_z is not None:
             added_height_above_ground_m = _lidar_height_at_mask(
                 mask=comp,
@@ -1033,17 +1620,17 @@ def stage_change(
                 percentile=added_height_pctl,
             )
             if added_height_above_ground_m is None:
-                # No LiDAR coverage for this component. Don't fully drop
-                # it — the candidate may be a real building outside the
-                # LiDAR tile's footprint. Emit with change_type =
-                # "candidate_added" and a low confidence, so frontends
-                # can render it faded ("possibly added, no LiDAR
-                # confirmation").
                 added_reject_reasons["no_lidar_coverage_emitted_as_candidate"] += 1
                 emit_as_candidate = True
-            elif added_height_above_ground_m < added_min_height_m:
-                added_reject_reasons["too_short"] += 1
-                continue
+                candidate_reason = "no_lidar_coverage"
+            elif added_height_above_ground_m < added_max_baseline_h:
+                # Ground-level at the baseline epoch: positive evidence of
+                # new construction.
+                strong_added = True
+            else:
+                added_reject_reasons["preexisting_structure_emitted_as_candidate"] += 1
+                emit_as_candidate = True
+                candidate_reason = "preexisting_structure_in_baseline_lidar"
 
         if emit_as_candidate:
             change_type_emitted = "candidate_added"
@@ -1053,14 +1640,25 @@ def stage_change(
         else:
             change_type_emitted = "added"
             counts["added"] += 1
-            confidence_emitted = _classification_confidence(
-                change_type="added",
-                iou=None,
-                unchanged_thresh=unchanged_thresh,
-                modified_thresh=modified_thresh,
+            confidence_emitted = (
+                _added_strong_confidence()
+                if strong_added
+                else _classification_confidence(
+                    change_type="added",
+                    iou=None,
+                    unchanged_thresh=unchanged_thresh,
+                    modified_thresh=modified_thresh,
+                )
             )
 
         area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
+        # NOTE: for added/candidate_added features, height_m is the
+        # BASELINE-epoch LiDAR height (near 0 for confirmed new builds).
+        added_extra: dict[str, Any] = {}
+        if candidate_reason is not None:
+            added_extra["candidate_reason"] = candidate_reason
+        if strong_added:
+            added_extra["baseline_lidar_flat"] = True
         polys = _polygon_coords_from_pixel_mask(comp, transform=transform)
         for coordinates in polys:
             features.append(
@@ -1074,6 +1672,7 @@ def stage_change(
                     crs_value=crs_value,
                     height_m=added_height_above_ground_m,
                     confidence=confidence_emitted,
+                    extra_props=added_extra or None,
                 )
             )
 
@@ -1095,13 +1694,26 @@ def stage_change(
         if isinstance(f.get("properties"), dict)
         and f["properties"].get("baseline_iou") is not None
     ]
+    # Median over NON-demolished baseline features only. Demolished
+    # footprints legitimately score IoU≈0 — a genuinely redeveloping block
+    # would otherwise drag the median down, lower the adaptive threshold,
+    # and suppress real 'modified' calls on exactly the tiles that matter.
+    # The COUNT gate stays on all baseline-derived samples so demolition-
+    # heavy tiles keep the adaptive + borderline passes.
+    median_samples = [
+        f["properties"]["baseline_iou"]
+        for f in features
+        if isinstance(f.get("properties"), dict)
+        and f["properties"].get("baseline_iou") is not None
+        and f["properties"].get("change_type") != "demolished"
+    ] or iou_samples
     unchanged_thresh_used = unchanged_thresh
     # Need a real sample size to trust the median — the adaptive logic is
     # only meaningful on a real-world tile with many baselines, never on
     # tests / synthetic fixtures where we'd otherwise classify the only
     # input feature against its own IoU.
     if len(iou_samples) >= _adaptive_threshold_min_samples():
-        median_iou = float(np.median(iou_samples))
+        median_iou = float(np.median(median_samples))
         summary.qa["median_baseline_iou"] = round(median_iou, 4)
         adaptive = max(_unchanged_iou_floor(), min(unchanged_thresh, median_iou - 0.10))
         if adaptive + 1e-9 < unchanged_thresh:
@@ -1232,14 +1844,29 @@ def stage_change(
     # Surface breakdown on summary.qa so operators can eyeball noise levels
     # without parsing the geojson.
     summary.qa["change_counts"] = dict(counts)
-    # Why the "added" gate rejected candidates — diagnostic signal for
-    # tuning. Empty buckets are fine. total = rejected; accepted is
-    # change_counts["added"].
+    summary.qa["local_registration_applied"] = int(local_reg_applied)
+    summary.qa["baseline_edge_changes_skipped"] = {
+        **baseline_edge_changes_skipped,
+        "total": int(sum(baseline_edge_changes_skipped.values())),
+    }
+    # Why the generic AMG/prompted added gate rejected candidates. Semantic
+    # current-footprint additions bypass this noisy candidate lane and are
+    # counted separately in semantic_current_change_counts.
     summary.qa["added_rejected"] = dict(added_reject_reasons)
 
+    classification_change_mask = np.logical_or(
+        np.logical_and(classification_im, np.logical_not(base)),
+        np.logical_and(base, np.logical_not(classification_im)),
+    )
+    # Include current-only discovery pixels in the coarse downstream change
+    # mask, while keeping them out of the baseline IoU classifier above.
     change_mask = np.logical_or(
-        np.logical_and(im, np.logical_not(base)),
-        np.logical_and(base, np.logical_not(im)),
+        classification_change_mask,
+        (
+            np.logical_and(added_im, np.logical_not(base))
+            if generic_added_fallback_used
+            else np.zeros_like(base, dtype=bool)
+        ),
     ).astype(np.uint8)
     return {**ctx, "change_path": out_path, "change_mask": change_mask}
 
@@ -1261,25 +1888,45 @@ def _one_step_dilate(mask):
 
 
 def _n_step_dilate(mask, steps: int):
-    """Iterated 3x3 dilation for `steps` rounds. Equivalent to a binary
-    dilation by an `(2*steps+1) x (2*steps+1)` square kernel.
+    """Binary dilation by a `(2*steps+1) x (2*steps+1)` square kernel
+    (identical result to `steps` iterated 3x3 dilations).
 
-    Pure numpy (no scipy/skimage) — same pattern as `_one_step_dilate`,
-    just looped. Used by the courtyard filter on 'added' candidates: an
-    8-step dilation of the baseline mask widens each footprint by ~4 m at
-    0.5 m/px, closing the typical road/sidewalk gap so candidates whose
-    centroid lies inside the dilated mask (i.e. surrounded by buildings)
-    can be rejected.
+    Pure numpy (no scipy/skimage). A Chebyshev-ball dilation is separable
+    into per-axis 1-D dilations, and each 1-D dilation is built by
+    log-doubling shifted ORs: an accumulator with reach R, OR'd with copies
+    shifted ±(R+1), has contiguous reach 2R+1. That's O(log steps) full-tile
+    passes instead of O(steps) — the old 24-iteration loop over the whole
+    tile was a measurable cost in the batch path.
+
+    Used by the courtyard filter on 'added' candidates: dilating the
+    baseline mask closes the typical road/sidewalk gap so candidates whose
+    centroid lies inside the dilated mask can be rejected.
     """
     import numpy as np
 
     m = np.asarray(mask).astype(bool)
     if steps <= 0 or not m.any():
         return m
-    out = m
-    for _ in range(int(steps)):
-        out = _one_step_dilate(out)
-    return out
+
+    def _dilate_axis(arr, axis: int, n: int):
+        out = arr
+        reach = 0
+        while reach < n:
+            s = min(reach + 1, n - reach)
+            shifted_pos = np.zeros_like(out)
+            shifted_neg = np.zeros_like(out)
+            if axis == 0:
+                shifted_pos[s:, :] = out[:-s, :]
+                shifted_neg[:-s, :] = out[s:, :]
+            else:
+                shifted_pos[:, s:] = out[:, :-s]
+                shifted_neg[:, :-s] = out[:, s:]
+            out = out | shifted_pos | shifted_neg
+            reach += s
+        return out
+
+    n = int(steps)
+    return _dilate_axis(_dilate_axis(m, 0, n), 1, n)
 
 
 def _lidar_height_at_mask(

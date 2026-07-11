@@ -232,7 +232,17 @@ def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -
             baseline_mask = ctx.get("refined_baseline_mask", ctx.get("baseline_mask"))
 
         summary.qa["baseline_footprints_used"] = bool(ctx.get("baseline_footprints_mask") is not None)
-        summary.qa["lidar_used"] = ctx.get("mesh_height_source") == "lidar"
+        # LiDAR is sampled during refine and also consumed by change
+        # classification, even when callers intentionally skip mesh output.
+        # Treat either contribution as real LiDAR use so change-only batch
+        # summaries do not falsely attest that LiDAR was ignored.
+        summary.qa["lidar_used"] = bool(
+            ctx.get("mesh_height_source") == "lidar"
+            or (
+                ctx.get("lidar_heights") is not None
+                and ctx.get("lidar_ground_z") is not None
+            )
+        )
 
         # Attest to the real input bytes used by this run. These let a reader
         # of run_summary.json answer "did this run actually use real imagery?"
@@ -296,11 +306,25 @@ def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -
                     np.asarray(ref_mask).astype(bool),
                     np.asarray(baseline_mask).astype(bool),
                 )
-                summary.qa["change_polygon_f1"] = mask_f1(predicted_change, reference_change)
+                # HONESTY NOTE: this is NOT an accuracy metric. The
+                # "reference" is the raw XOR of the two masks the classifier
+                # itself consumes — circular by construction — and the
+                # classifier is *designed* to suppress exactly the XOR noise
+                # this rewards, so correctness improvements tend to LOWER it.
+                # It survives as a coarse mask-agreement/change-magnitude
+                # signal only. Per-class accuracy lives in the DOB weak-label
+                # harness (research/weak_label_eval.py in citylens-parcel-
+                # intel consumers). `change_polygon_f1` is a deprecated alias
+                # kept one release for run_summary.json readers.
+                xor_f1 = mask_f1(predicted_change, reference_change)
+                summary.qa["mask_xor_f1"] = xor_f1
+                summary.qa["change_polygon_f1"] = xor_f1
             except Exception as e:
-                summary.warn(f"qa.change_polygon_f1 failed: {type(e).__name__}: {e}")
+                summary.warn(f"qa.mask_xor_f1 failed: {type(e).__name__}: {e}")
+                summary.qa["mask_xor_f1"] = None
                 summary.qa["change_polygon_f1"] = None
         else:
+            summary.qa["mask_xor_f1"] = None
             summary.qa["change_polygon_f1"] = None
 
         mesh_footprint_mask = ctx.get("mesh_footprint_mask")
@@ -315,7 +339,7 @@ def run_citylens(request: Any, work_dir: Path, progress_cb: ProgressCb = None) -
 
         computed = [
             summary.qa.get("mask_iou") is not None,
-            summary.qa.get("change_polygon_f1") is not None,
+            summary.qa.get("mask_xor_f1") is not None,
             summary.qa.get("mesh_footprint_iou") is not None,
         ]
         if all(computed):

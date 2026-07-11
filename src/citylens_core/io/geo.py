@@ -15,6 +15,7 @@ __all__ = [
     "binary_dilate",
     "binary_erode",
     "binary_open",
+    "binary_mask_stats",
     "clean_binary_mask",
     "geojson_crs_hint",
     "load_geojson_geometries",
@@ -30,6 +31,47 @@ def _as_bool_mask(mask: Any) -> np.ndarray:
     if arr.ndim != 2:
         raise ValueError("mask must be 2D")
     return arr
+
+
+def binary_mask_stats(mask: Any) -> dict[str, int | float]:
+    """Return compact coverage/component QA for a binary mask.
+
+    Component areas come from pixel-space polygons emitted by rasterio, so
+    this avoids allocating a full integer label grid merely for diagnostics.
+    """
+    arr = _as_bool_mask(mask)
+    pixel_count = int(arr.sum())
+    component_count = 0
+    largest_component_pixels = 0
+    if pixel_count:
+        for geom, value in shapes(
+            arr.astype(np.uint8),
+            mask=arr,
+            transform=Affine.identity(),
+        ):
+            if int(value) != 1:
+                continue
+            component_count += 1
+            try:
+                area = int(round(float(shapely_shape(geom).area)))
+            except Exception:
+                area = 0
+            largest_component_pixels = max(largest_component_pixels, area)
+
+    total_pixels = int(arr.size)
+    return {
+        "pixels": pixel_count,
+        "coverage_fraction": (
+            float(pixel_count) / float(total_pixels) if total_pixels else 0.0
+        ),
+        "component_count": component_count,
+        "largest_component_pixels": largest_component_pixels,
+        "largest_component_fraction": (
+            float(largest_component_pixels) / float(total_pixels)
+            if total_pixels
+            else 0.0
+        ),
+    }
 
 
 def load_geojson_geometries(path: Path) -> list[BaseGeometry]:

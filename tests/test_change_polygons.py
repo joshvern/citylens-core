@@ -11,6 +11,51 @@ from affine import Affine
 from PIL import Image
 
 
+def _current_feature(
+    *,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    construction_year: int,
+    base_bbl: str = "4000000000",
+) -> dict:
+    return {
+        "type": "Feature",
+        "properties": {
+            "construction_year": construction_year,
+            "last_status_type": "Constructed",
+            "geom_source": "nyc_building_footprints",
+            "base_bbl": base_bbl,
+            "mappluto_bbl": base_bbl,
+            "source_dataset": "building_footprints+mappluto",
+        },
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [
+                [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
+            ],
+        },
+    }
+
+
+def _write_current_footprints(tmp_path: Path, features: list[dict]) -> Path:
+    path = tmp_path / "current_footprints.geojson"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "crs": {
+                    "type": "name",
+                    "properties": {"name": "EPSG:3857"},
+                },
+                "features": features,
+            }
+        )
+    )
+    return path
+
+
 def _run_stage(tmp_path: Path, *, mask, baseline_mask, transform=None, crs=None, ctx_extra=None):
     from citylens_core.models import CitylensRequest, PipelineSummary
     from citylens_core.stages.change import stage_change
@@ -34,6 +79,367 @@ def _run_stage(tmp_path: Path, *, mask, baseline_mask, transform=None, crs=None,
     out = stage_change(req, tmp_path, ctx, summary)
     payload = json.loads((tmp_path / "change.geojson").read_text())
     return payload, summary, out
+
+
+def test_post_baseline_current_footprint_emits_semantic_added(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A dated footprint in baseline-empty space bypasses noisy AMG gates."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=2, y0=2, x1=10, y1=10, construction_year=1900
+            ),
+            _current_feature(
+                x0=25,
+                y0=25,
+                x1=34,
+                y1=34,
+                construction_year=2022,
+                base_bbl="4016020028",
+            ),
+        ],
+    )
+    base = np.zeros((40, 40), dtype=np.uint8)
+    base[2:10, 2:10] = 1
+    sam = base.copy()
+    # Even if AMG independently sees the new roof, the semantic collection
+    # disables generic emission so the building appears exactly once.
+    discovery = np.zeros_like(base)
+    discovery[25:34, 25:34] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=sam,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+        ctx_extra={"refined_added_discovery_mask": discovery},
+    )
+
+    added = [
+        feature
+        for feature in payload["features"]
+        if feature["properties"]["change_type"] == "added"
+    ]
+    assert len(added) == 1
+    props = added[0]["properties"]
+    assert props["construction_year"] == 2022
+    assert props["base_bbl"] == "4016020028"
+    assert props["mappluto_bbl"] == "4016020028"
+    assert props["last_status_type"] == "Constructed"
+    assert props["geom_source"] == "nyc_building_footprints"
+    assert props["source_dataset"] == "building_footprints+mappluto"
+    assert props["current_footprint_semantic"] is True
+    assert props["semantic_change_basis"] == "construction_year"
+    assert props["baseline_overlap_fraction"] == 0.0
+    assert 0.8 <= props["confidence"] < 1.0
+    assert summary.qa["current_footprints_used"] is True
+    assert summary.qa["generic_added_fallback_used"] is False
+    assert summary.qa["semantic_current_change_counts"] == {
+        "added": 1,
+        "modified": 0,
+    }
+
+
+def test_post_baseline_expansion_emits_modified_and_supersedes_old_footprint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Construction-year evidence overrides shape-only 'unchanged'."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=8,
+                y0=8,
+                x1=24,
+                y1=24,
+                construction_year=2021,
+                base_bbl="3000000001",
+            )
+        ],
+    )
+    base = np.zeros((32, 32), dtype=np.uint8)
+    base[10:22, 10:22] = 1
+    # SAM/current geometry fully covers the old footprint, which would be
+    # shape-only unchanged without the dated semantic source.
+    sam = np.zeros_like(base)
+    sam[8:24, 8:24] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=sam,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert [f["properties"]["change_type"] for f in payload["features"]] == [
+        "modified"
+    ]
+    props = payload["features"][0]["properties"]
+    assert props["construction_year"] == 2021
+    assert props["baseline_overlap_fraction"] > 0.5
+    assert 0.8 <= props["confidence"] < 1.0
+    assert summary.qa["semantic_baseline_outputs_suppressed"] == 1
+    assert summary.qa["change_counts"] == {
+        "unchanged": 0,
+        "modified": 1,
+        "demolished": 0,
+        "added": 0,
+    }
+
+
+def test_tiny_semantic_added_respects_commercial_area_floor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("CITYLENS_CHANGE_MIN_AREA_M2", raising=False)
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=10, y0=10, x1=15, y1=15, construction_year=2022
+            )
+        ],
+    )
+    empty = np.zeros((30, 30), dtype=np.uint8)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=empty,
+        baseline_mask=empty,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert payload["features"] == []
+    assert summary.qa["semantic_current_change_counts"]["added"] == 0
+    assert summary.qa["semantic_current_rejected"]["too_small"] == 1
+    assert summary.qa["change_counts"]["added"] == 0
+
+
+def test_tiny_semantic_modified_does_not_suppress_baseline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("CITYLENS_CHANGE_MIN_AREA_M2", raising=False)
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=10, y0=10, x1=15, y1=15, construction_year=2022
+            )
+        ],
+    )
+    base = np.zeros((30, 30), dtype=np.uint8)
+    base[10:15, 10:15] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=base,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert [f["properties"]["change_type"] for f in payload["features"]] == [
+        "unchanged"
+    ]
+    assert summary.qa["semantic_current_change_counts"]["modified"] == 0
+    assert summary.qa["semantic_current_rejected"]["too_small"] == 1
+    assert summary.qa["semantic_baseline_outputs_suppressed"] == 0
+
+
+def test_semantic_multipolygon_emits_one_event_with_total_area(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("CITYLENS_CHANGE_MIN_AREA_M2", raising=False)
+    feature = _current_feature(
+        x0=0, y0=0, x1=1, y1=1, construction_year=2022
+    )
+    feature["geometry"] = {
+        "type": "MultiPolygon",
+        "coordinates": [
+            [[[2, 2], [10, 2], [10, 10], [2, 10], [2, 2]]],
+            [[[20, 20], [28, 20], [28, 28], [20, 28], [20, 20]]],
+        ],
+    }
+    _write_current_footprints(tmp_path, [feature])
+    empty = np.zeros((40, 40), dtype=np.uint8)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=empty,
+        baseline_mask=empty,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert len(payload["features"]) == 1
+    emitted = payload["features"][0]
+    assert emitted["geometry"]["type"] == "MultiPolygon"
+    assert len(emitted["geometry"]["coordinates"]) == 2
+    assert emitted["properties"]["area_m2"] == 128.0
+    assert summary.qa["semantic_current_change_counts"] == {
+        "added": 1,
+        "modified": 0,
+    }
+    assert summary.qa["change_counts"]["added"] == 1
+
+
+def test_semantic_edge_added_is_rejected_while_interior_added_emits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=0, y0=5, x1=10, y1=15, construction_year=2022,
+                base_bbl="edge",
+            ),
+            _current_feature(
+                x0=20, y0=20, x1=30, y1=30, construction_year=2022,
+                base_bbl="interior",
+            ),
+        ],
+    )
+    empty = np.zeros((40, 40), dtype=np.uint8)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=empty,
+        baseline_mask=empty,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    added = [
+        feature
+        for feature in payload["features"]
+        if feature["properties"]["change_type"] == "added"
+    ]
+    assert len(added) == 1
+    assert added[0]["properties"]["base_bbl"] == "interior"
+    assert summary.qa["semantic_current_rejected"]["border_touching"] == 1
+    assert summary.qa["semantic_current_change_counts"]["added"] == 1
+    assert summary.qa["change_counts"]["added"] == 1
+
+
+def test_rejected_semantic_edge_modified_preserves_unchanged_presence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=0, y0=5, x1=10, y1=15, construction_year=2022
+            )
+        ],
+    )
+    base = np.zeros((25, 25), dtype=np.uint8)
+    base[5:15, 0:10] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=base,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert [f["properties"]["change_type"] for f in payload["features"]] == [
+        "unchanged"
+    ]
+    assert summary.qa["semantic_current_rejected"]["border_touching"] == 1
+    assert summary.qa["semantic_current_change_counts"]["modified"] == 0
+    assert summary.qa["baseline_edge_changes_skipped"]["total"] == 0
+    assert summary.qa["change_counts"]["unchanged"] == 1
+
+
+def test_pre_baseline_current_footprint_is_not_falsely_added(
+    tmp_path: Path,
+) -> None:
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=10, y0=10, x1=20, y1=20, construction_year=2005
+            )
+        ],
+    )
+    empty = np.zeros((30, 30), dtype=np.uint8)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=empty,
+        baseline_mask=empty,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert payload["features"] == []
+    assert summary.qa["change_counts"]["added"] == 0
+    assert summary.qa["semantic_current_change_counts"]["added"] == 0
+    assert summary.qa["generic_added_fallback_used"] is False
+
+
+def test_valid_empty_current_collection_is_authoritative(tmp_path: Path) -> None:
+    _write_current_footprints(tmp_path, [])
+    base = np.zeros((24, 24), dtype=np.uint8)
+    base[6:18, 6:18] = 1
+    # SAM still sees a roof, but the successful semantic source attests there
+    # are no current buildings in the AOI. Empty is not an API-failure fallback.
+    sam = base.copy()
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=sam,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    kinds = [feature["properties"]["change_type"] for feature in payload["features"]]
+    assert kinds == ["demolished"]
+    assert summary.qa["current_footprints_used"] is True
+    assert summary.qa["current_footprint_feature_count"] == 0
+    assert summary.qa["generic_added_fallback_used"] is False
+
+
+def test_current_footprint_presence_prevents_sam_miss_false_demolition(
+    tmp_path: Path,
+) -> None:
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=6, y0=6, x1=18, y1=18, construction_year=1910
+            )
+        ],
+    )
+    base = np.zeros((24, 24), dtype=np.uint8)
+    base[6:18, 6:18] = 1
+    sam_miss = np.zeros_like(base)
+
+    payload, summary, out = _run_stage(
+        tmp_path,
+        mask=sam_miss,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    kinds = [feature["properties"]["change_type"] for feature in payload["features"]]
+    assert kinds == ["unchanged"]
+    assert summary.qa["change_counts"]["demolished"] == 0
+    assert summary.qa["current_presence_source"] == "current_footprints"
+    assert summary.qa["registration"]["mode"] == "semantic_exact"
+    # SAM stays untouched for pipeline-level mask QA and fallback rendering.
+    assert not out["mask"].any()
 
 
 def test_unchanged_building_gets_unchanged_feature(tmp_path: Path, monkeypatch) -> None:
@@ -93,6 +499,37 @@ def test_demolished_building_gets_demolished_feature(tmp_path: Path, monkeypatch
     assert summary.qa["change_counts"]["demolished"] == 1
 
 
+def test_component_path_skips_edge_modified_but_keeps_interior_modified(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CITYLENS_CHANGE_REGISTRATION_MAX_SHIFT_PX", "0")
+    monkeypatch.setenv("CITYLENS_CHANGE_LOCAL_REGISTRATION_MAX_SHIFT_PX", "0")
+    base = np.zeros((40, 40), dtype=np.uint8)
+    current = np.zeros_like(base)
+    # Edge and interior baselines both have 30% current coverage -> modified.
+    base[5:15, 0:10] = 1
+    current[5:15, 0:3] = 1
+    base[22:32, 22:32] = 1
+    current[22:32, 22:25] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=current,
+        baseline_mask=base,
+    )
+
+    assert summary.qa["change_source"] == "component_labeled"
+    assert [f["properties"]["change_type"] for f in payload["features"]] == [
+        "modified"
+    ]
+    assert summary.qa["baseline_edge_changes_skipped"] == {
+        "modified": 1,
+        "demolished": 0,
+        "total": 1,
+    }
+    assert summary.qa["change_counts"]["modified"] == 1
+
+
 def test_added_building_gets_added_feature(tmp_path: Path, monkeypatch) -> None:
     """Current-year component that doesn't touch any baseline footprint → added."""
     monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "16")
@@ -115,6 +552,118 @@ def test_added_building_gets_added_feature(tmp_path: Path, monkeypatch) -> None:
     # 'added' features don't get a baseline_iou.
     assert added[0]["properties"].get("baseline_iou") is None
     assert summary.qa["change_counts"]["added"] == 1
+
+
+def test_separate_discovery_finds_added_without_changing_baseline_classification(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Prompted IoU and automatic added discovery remain independent.
+
+    The prompted mask contains only the unchanged baseline building.  The
+    discovery mask deliberately omits that building and contains only a new
+    isolated roof.  Replacing the prompted mask with discovery would classify
+    the baseline as demolished; ignoring discovery would miss the addition.
+    """
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "4")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", "4")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    prompted = np.zeros((40, 40), dtype=np.uint8)
+    discovery = np.zeros((40, 40), dtype=np.uint8)
+    base[3:11, 3:11] = 1
+    prompted[3:11, 3:11] = 1
+    discovery[28:35, 28:35] = 1
+
+    payload, summary, out = _run_stage(
+        tmp_path,
+        mask=prompted,
+        baseline_mask=base,
+        ctx_extra={"refined_added_discovery_mask": discovery},
+    )
+
+    kinds = [f["properties"]["change_type"] for f in payload["features"]]
+    assert kinds.count("unchanged") == 1
+    assert kinds.count("added") == 1
+    assert "demolished" not in kinds
+    assert summary.qa["added_mask_source"] == "refined_added_discovery_mask"
+    assert out["change_mask"][30, 30] == 1
+
+    # Without the discovery key, the same prompted mask cannot contain the
+    # genuinely new component and therefore emits no added feature.
+    payload_without, summary_without, _ = _run_stage(
+        tmp_path,
+        mask=prompted,
+        baseline_mask=base,
+    )
+    kinds_without = [
+        f["properties"]["change_type"] for f in payload_without["features"]
+    ]
+    assert kinds_without == ["unchanged"]
+    assert summary_without.qa["change_counts"]["added"] == 0
+
+
+def test_discovery_component_still_uses_added_lidar_gate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Baseline-epoch flat LiDAR confirms a discovery-only addition."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "4")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", "4")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    prompted = np.zeros((40, 40), dtype=np.uint8)
+    discovery = np.zeros((40, 40), dtype=np.uint8)
+    base[3:11, 3:11] = 1
+    prompted[3:11, 3:11] = 1
+    discovery[28:35, 28:35] = 1
+    lidar = np.zeros((40, 40), dtype=np.float32)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=prompted,
+        baseline_mask=base,
+        ctx_extra={
+            "refined_added_discovery_mask": discovery,
+            "lidar_heights": lidar,
+            "lidar_ground_z": 0.0,
+        },
+    )
+
+    added = [
+        f for f in payload["features"] if f["properties"]["change_type"] == "added"
+    ]
+    assert len(added) == 1
+    assert added[0]["properties"]["baseline_lidar_flat"] is True
+    assert added[0]["properties"]["confidence"] >= 0.85
+    assert summary.qa["change_counts"]["added"] == 1
+
+
+def test_border_touching_discovery_blob_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A tile-scale AMG road/background blob must not become an addition."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "4")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    prompted = np.zeros((40, 40), dtype=np.uint8)
+    discovery = np.zeros((40, 40), dtype=np.uint8)
+    base[20:28, 20:28] = 1
+    prompted[20:28, 20:28] = 1
+    discovery[0:12, 0:35] = 1
+    lidar = np.zeros((40, 40), dtype=np.float32)
+
+    _, summary, _ = _run_stage(
+        tmp_path,
+        mask=prompted,
+        baseline_mask=base,
+        ctx_extra={
+            "refined_added_discovery_mask": discovery,
+            "lidar_heights": lidar,
+            "lidar_ground_z": 0.0,
+        },
+    )
+
+    assert summary.qa["change_counts"]["added"] == 0
+    assert summary.qa["added_rejected"]["border_touching"] == 1
 
 
 def test_sliver_along_baseline_edge_is_NOT_flagged_as_added(
@@ -343,6 +892,53 @@ def test_per_source_feature_splits_adjacent_row_houses(tmp_path: Path, monkeypat
         assert f["properties"]["change_type"] == "unchanged"
 
 
+def test_per_source_path_skips_edge_demolition_but_keeps_interior_demolition(
+    tmp_path: Path,
+) -> None:
+    edge = {
+        "type": "Feature",
+        "properties": {"Source": "edge"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[0, 5], [10, 5], [10, 15], [0, 15], [0, 5]]],
+        },
+    }
+    interior = {
+        "type": "Feature",
+        "properties": {"Source": "interior"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [
+                [[22, 22], [32, 22], [32, 32], [22, 32], [22, 22]]
+            ],
+        },
+    }
+    _write_baseline_geojson(tmp_path, [edge, interior])
+    base = np.zeros((40, 40), dtype=np.uint8)
+    base[5:15, 0:10] = 1
+    base[22:32, 22:32] = 1
+    current = np.zeros_like(base)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=current,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert summary.qa["change_source"] == "per_source_feature"
+    assert len(payload["features"]) == 1
+    assert payload["features"][0]["properties"]["change_type"] == "demolished"
+    assert payload["features"][0]["properties"]["Source"] == "interior"
+    assert summary.qa["baseline_edge_changes_skipped"] == {
+        "modified": 0,
+        "demolished": 1,
+        "total": 1,
+    }
+    assert summary.qa["change_counts"]["demolished"] == 1
+
+
 def test_per_source_feature_fallback_when_no_geojson(tmp_path: Path, monkeypatch) -> None:
     """Without baseline_footprints.geojson on disk, stage falls back to the
     component-labeling path and still produces valid output."""
@@ -427,23 +1023,28 @@ def test_per_source_feature_requires_transform(tmp_path: Path, monkeypatch) -> N
     assert summary.qa["change_source"] == "component_labeled"
 
 
-def test_lidar_height_gate_rejects_short_added_components(
+def test_baseline_epoch_flat_lidar_confirms_added(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """An 'added' candidate whose LiDAR height is below the threshold is
-    rejected. Simulates a tree/shadow/pavement blob SAM2 segmented."""
-    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
-    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M", "2.0")
+    """BASELINE-epoch LiDAR semantics: the LiDAR grid is contemporaneous
+    with the 2017 baseline, so ground-level LiDAR inside a 2024 building-
+    shaped component means the parcel was EMPTY in 2017 — positive evidence
+    of new construction. Accepted as 'added' with boosted confidence.
 
-    # 5x5 isolated component in imagery, empty baseline → would be 'added'.
+    (Under the old current-epoch assumption this exact fixture was rejected
+    'too_short' — i.e. the gate rejected precisely the new buildings it
+    existed to find.)"""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_MAX_BASELINE_HEIGHT_M", "2.0")
+
+    # 5x5 isolated component in imagery, empty baseline → 'added' candidate.
     base = np.zeros((30, 30), dtype=np.uint8)
     img = np.zeros((30, 30), dtype=np.uint8)
     img[10:15, 10:15] = 1
 
-    # LiDAR heights grid with ALL values at 0.5m above ground. Clearly below
-    # the 2m threshold → reject.
+    # 2017 LiDAR: 0.5 m above ground everywhere — bare lot back then.
     heights = np.full((30, 30), 1.5, dtype=np.float32)
-    ground = 1.0  # 0.5m above ground
+    ground = 1.0
 
     from citylens_core.models import CitylensRequest, PipelineSummary
     from citylens_core.stages.change import stage_change
@@ -460,22 +1061,36 @@ def test_lidar_height_gate_rejects_short_added_components(
         "lidar_heights": heights, "lidar_ground_z": ground,
     }
     stage_change(req, tmp_path, ctx, summary)
-    assert summary.qa["change_counts"]["added"] == 0
-    assert summary.qa["added_rejected"]["too_short"] == 1
+    assert summary.qa["change_counts"]["added"] == 1
+    assert summary.qa["added_rejected"]["preexisting_structure_emitted_as_candidate"] == 0
+
+    payload = json.loads((tmp_path / "change.geojson").read_text())
+    added = [
+        f for f in payload["features"]
+        if f["properties"]["change_type"] == "added"
+    ]
+    assert len(added) == 1
+    # Two independent signals agree (flat-2017 + building-2024): boosted
+    # confidence and an audit flag.
+    assert added[0]["properties"]["confidence"] >= 0.85
+    assert added[0]["properties"]["baseline_lidar_flat"] is True
 
 
-def test_lidar_height_gate_accepts_tall_added_components(
+def test_baseline_epoch_tall_lidar_demotes_added_to_candidate(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """An 'added' candidate whose LiDAR height clears the threshold is kept."""
+    """A component that was TALL in the 2017 LiDAR already had a structure
+    (tree canopy or a building missing from the footprints GDB) — it is NOT
+    new construction, so it demotes to candidate_added for review instead of
+    being confidently accepted."""
     monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
-    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M", "2.0")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_MAX_BASELINE_HEIGHT_M", "2.0")
 
     base = np.zeros((30, 30), dtype=np.uint8)
     img = np.zeros((30, 30), dtype=np.uint8)
     img[10:15, 10:15] = 1
 
-    # 10m above ground — a real one-story building.
+    # 10 m above ground in the 2017 grid — something already stood there.
     heights = np.full((30, 30), 10.0, dtype=np.float32)
     ground = 0.0
 
@@ -494,8 +1109,20 @@ def test_lidar_height_gate_accepts_tall_added_components(
         "lidar_heights": heights, "lidar_ground_z": ground,
     }
     stage_change(req, tmp_path, ctx, summary)
-    assert summary.qa["change_counts"]["added"] == 1
-    assert summary.qa["added_rejected"]["too_short"] == 0
+    assert summary.qa["change_counts"]["added"] == 0
+    assert summary.qa["change_counts"]["candidate_added"] == 1
+    assert summary.qa["added_rejected"]["preexisting_structure_emitted_as_candidate"] == 1
+
+    payload = json.loads((tmp_path / "change.geojson").read_text())
+    cands = [
+        f for f in payload["features"]
+        if f["properties"]["change_type"] == "candidate_added"
+    ]
+    assert len(cands) == 1
+    assert (
+        cands[0]["properties"]["candidate_reason"]
+        == "preexisting_structure_in_baseline_lidar"
+    )
 
 
 def test_lidar_height_gate_skipped_when_lidar_absent(
@@ -513,32 +1140,73 @@ def test_lidar_height_gate_skipped_when_lidar_absent(
     assert summary.qa["change_counts"]["added"] == 1
     assert summary.qa["added_rejected"] == {
         "too_small": 0,
+        "border_touching": 0,
         "baseline_overlap": 0,
         "centroid_near_baseline": 0,
         "majority_inside_baseline_dilation": 0,
-        "too_short": 0,
+        "vegetation": 0,
+        "preexisting_structure_emitted_as_candidate": 0,
         "no_lidar_coverage_emitted_as_candidate": 0,
     }
 
 
-def test_demolished_is_rescued_to_modified_when_lidar_shows_a_standing_building(
+def test_demolished_stays_demolished_under_baseline_epoch_lidar(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """SAM2 sometimes misses a building entirely (dark roof on shadowed
-    imagery → IoU≈0) and the naive rule wrongly labels it demolished. If
-    LiDAR shows a real structure standing inside the baseline footprint,
-    downgrade demolished→modified — the SAM2 mask is unreliable but LiDAR
-    confirms the building is still there."""
+    """Default epoch is 'baseline' (production reality: 2017 LiDAR vs 2024
+    imagery). A standing structure in baseline-epoch LiDAR is EXPECTED for a
+    genuine 2017→2024 demolition — the old building was there in 2017 either
+    way — so the rescue must NOT fire, or every real demolition would get
+    silently downgraded to 'modified' (the old behavior)."""
     monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
     monkeypatch.setenv("CITYLENS_CHANGE_DEMOLISHED_MAX_HEIGHT_M", "3.0")
 
     base = np.zeros((20, 20), dtype=np.uint8)
     img = np.zeros((20, 20), dtype=np.uint8)
     base[2:12, 2:12] = 1
-    # SAM2 mask is empty inside the footprint → IoU = 0 → naive demolished.
+    # SAM2 2024 mask empty inside the footprint: the building is gone.
 
-    # LiDAR says the building is still there: 15 m above a 0 m ground
-    # plane is a clear five-story building.
+    # 2017 LiDAR shows the (since-demolished) building standing — expected.
+    heights = np.full((20, 20), 15.0, dtype=np.float32)
+    ground = 0.0
+
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.change import stage_change
+
+    req = CitylensRequest(
+        address="x", segmentation_backend="sam2",
+        imagery_year=2024, baseline_year=2017,
+    )
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc),
+    )
+    ctx = {
+        "mask": img, "baseline_mask": base,
+        "lidar_heights": heights, "lidar_ground_z": ground,
+    }
+    stage_change(req, tmp_path, ctx, summary)
+    payload = json.loads((tmp_path / "change.geojson").read_text())
+    kinds = [f["properties"]["change_type"] for f in payload["features"]]
+    assert kinds == ["demolished"], f"expected demolished to stand, got {kinds}"
+    assert summary.qa["change_counts"]["demolished"] == 1
+    assert summary.qa["demolished_downgraded_to_modified"] == 0
+    assert summary.qa["demolished_rescue_lidar_epoch"] == "baseline"
+
+
+def test_demolished_is_rescued_to_modified_with_current_epoch_lidar(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With CURRENT-epoch LiDAR (a deploy with fresh LiDAR), a standing
+    structure genuinely contradicts 'demolished': SAM2 missed the building
+    (dark roof / shadow) → downgrade demolished→modified."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_DEMOLISHED_MAX_HEIGHT_M", "3.0")
+    monkeypatch.setenv("CITYLENS_CHANGE_DEMOLISHED_RESCUE_LIDAR_EPOCH", "current")
+
+    base = np.zeros((20, 20), dtype=np.uint8)
+    img = np.zeros((20, 20), dtype=np.uint8)
+    base[2:12, 2:12] = 1
+
     heights = np.full((20, 20), 15.0, dtype=np.float32)
     ground = 0.0
 
@@ -837,7 +1505,7 @@ def test_lidar_no_coverage_emits_candidate_added_with_low_confidence(
     # Not counted as a confirmed add — held back for the candidate slot.
     assert summary.qa["change_counts"].get("added", 0) == 0
     assert summary.qa["change_counts"].get("candidate_added", 0) == 1
-    assert summary.qa["added_rejected"]["too_short"] == 0
+    assert summary.qa["added_rejected"]["preexisting_structure_emitted_as_candidate"] == 0
     assert summary.qa["added_rejected"]["no_lidar_coverage_emitted_as_candidate"] == 1
 
     payload = json.loads((tmp_path / "change.geojson").read_text())
@@ -1137,3 +1805,171 @@ def test_borderline_pass_does_not_touch_demolished_or_added(
     # Borderline pass moved the modifieds but left the demolished alone.
     recls = summary.qa.get("borderline_modified_reclassifications") or {}
     assert recls.get("to_unchanged", 0) >= 20
+
+
+# ----------------------------------------------------------------------
+# Mercator ground-area correction
+# ----------------------------------------------------------------------
+
+
+def test_pixel_area_corrects_web_mercator_latitude_distortion() -> None:
+    """EPSG:3857 'meters' are not ground meters: scale is sec(lat), so a
+    naive a*e product overstates ground area by sec²(lat) (~1.74x at NYC's
+    40.7°N). `_pixel_area_m2` must correct by cos²(lat) derived from the
+    transform's y-origin."""
+    import math
+
+    from citylens_core.stages.change import _pixel_area_m2
+
+    # NYC-ish web-mercator y (top edge). lat = atan(sinh(y/R)).
+    nyc_y = 4_970_000.0
+    lat = math.atan(math.sinh(nyc_y / 6378137.0))
+    tr = Affine(0.49, 0.0, -8_235_000.0, 0.0, -0.49, nyc_y)
+
+    got = _pixel_area_m2(tr, "EPSG:3857")
+    expected = 0.49 * 0.49 * math.cos(lat) ** 2
+    assert abs(got - expected) < 1e-9
+    # Sanity: the correction is substantial at NYC latitude (~43% smaller).
+    assert got < 0.49 * 0.49 * 0.62
+
+
+def test_pixel_area_equator_mercator_unchanged() -> None:
+    """At the equator (y≈0) the Mercator correction is a no-op — the
+    behavior every existing synthetic fixture depends on."""
+    from citylens_core.stages.change import _pixel_area_m2
+
+    tr = Affine(2.0, 0.0, 0.0, 0.0, -2.0, 0.0)
+    assert abs(_pixel_area_m2(tr, "EPSG:3857") - 4.0) < 1e-9
+
+
+def test_pixel_area_state_plane_feet_conversion() -> None:
+    """NY State Plane (EPSG:2263, US survey feet) converts ft² → m² without
+    a latitude correction."""
+    from citylens_core.stages.change import _pixel_area_m2
+
+    tr = Affine(1.0, 0.0, 0.0, 0.0, -1.0, 0.0)
+    got = _pixel_area_m2(tr, "EPSG:2263")
+    assert abs(got - 0.0929034116) < 1e-9
+
+
+# ----------------------------------------------------------------------
+# ExG vegetation reject on the 'added' path
+# ----------------------------------------------------------------------
+
+
+def _run_added_with_ortho(
+    tmp_path: Path, monkeypatch, *, color: tuple[int, int, int]
+):
+    """30x30 tile, one isolated 5x5 'added' candidate, orthophoto painted a
+    solid color inside the candidate. No LiDAR (isolates the ExG gate)."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+
+    base = np.zeros((30, 30), dtype=np.uint8)
+    img = np.zeros((30, 30), dtype=np.uint8)
+    img[10:15, 10:15] = 1
+
+    ortho = np.full((30, 30, 3), 90, dtype=np.uint8)  # neutral gray tile
+    ortho[10:15, 10:15] = np.array(color, dtype=np.uint8)
+    ortho_path = tmp_path / "orthophoto.png"
+    Image.fromarray(ortho, mode="RGB").save(ortho_path)
+
+    from citylens_core.models import CitylensRequest, PipelineSummary
+    from citylens_core.stages.change import stage_change
+
+    req = CitylensRequest(
+        address="x", segmentation_backend="sam2",
+        imagery_year=2024, baseline_year=2017,
+    )
+    summary = PipelineSummary(
+        request=req, work_dir=tmp_path, started_at=datetime.now(timezone.utc),
+    )
+    ctx = {
+        "mask": img,
+        "baseline_mask": base,
+        "orthophoto_path": ortho_path,
+    }
+    stage_change(req, tmp_path, ctx, summary)
+    return summary
+
+
+def test_added_vegetation_rejected_by_exg(tmp_path: Path, monkeypatch) -> None:
+    """A strongly green candidate (healthy canopy: ExG = 2G-R-B >> 30) is
+    rejected as vegetation — the baseline-epoch LiDAR gate can't catch a
+    tree that grew since 2017, so the imagery has to."""
+    summary = _run_added_with_ortho(tmp_path, monkeypatch, color=(60, 170, 60))
+    assert summary.qa["change_counts"]["added"] == 0
+    assert summary.qa["added_rejected"]["vegetation"] == 1
+
+
+def test_added_gray_roof_passes_exg(tmp_path: Path, monkeypatch) -> None:
+    """A gray building-colored candidate sails through the ExG gate."""
+    summary = _run_added_with_ortho(tmp_path, monkeypatch, color=(120, 120, 130))
+    assert summary.qa["change_counts"]["added"] == 1
+    assert summary.qa["added_rejected"]["vegetation"] == 0
+
+
+# ----------------------------------------------------------------------
+# Per-footprint local registration refinement
+# ----------------------------------------------------------------------
+
+
+def test_local_registration_recovers_residual_shift(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A footprint whose imagery mask is offset by 2 px (residual after the
+    global shift, e.g. small building outvoted by a big one) is recovered by
+    the ±2 px local refinement and classified unchanged instead of
+    modified/demolished."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    # Disable the global registration so the local pass is isolated.
+    monkeypatch.setenv("CITYLENS_CHANGE_REGISTRATION_MAX_SHIFT_PX", "0")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    img = np.zeros((40, 40), dtype=np.uint8)
+    base[10:20, 10:20] = 1
+    img[12:22, 12:22] = 1  # same 10x10 building, shifted (+2, +2)
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    kinds = [f["properties"]["change_type"] for f in payload["features"]]
+    assert kinds == ["unchanged"], (
+        f"local refinement should recover the 2px offset, got {kinds} "
+        f"(qa={summary.qa.get('local_registration_applied')})"
+    )
+    assert summary.qa["local_registration_applied"] == 1
+
+
+def test_local_registration_disabled_leaves_offset_penalized(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Same fixture with the local refinement disabled — the knob must
+    actually change the measured IoU. The 2 px offset leaves a degraded
+    IoU inside the padded ROI: intersection 8×8=64; the imagery blob is
+    clipped by the ROI window to 9×9=81, so IoU = 64/(100+81-64) = 64/117."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "1")
+    monkeypatch.setenv("CITYLENS_CHANGE_REGISTRATION_MAX_SHIFT_PX", "0")
+    monkeypatch.setenv("CITYLENS_CHANGE_LOCAL_REGISTRATION_MAX_SHIFT_PX", "0")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    img = np.zeros((40, 40), dtype=np.uint8)
+    base[10:20, 10:20] = 1
+    img[12:22, 12:22] = 1
+
+    payload, summary, _ = _run_stage(tmp_path, mask=img, baseline_mask=base)
+    assert summary.qa["local_registration_applied"] == 0
+    ious = [f["properties"]["baseline_iou"] for f in payload["features"]]
+    assert ious and abs(ious[0] - 64.0 / 117.0) < 0.01
+
+
+def test_n_step_dilate_matches_iterated_3x3_reference() -> None:
+    """The log-doubling separable dilation must be EXACTLY equivalent to the
+    old `steps`-times-iterated 3x3 dilation on arbitrary masks."""
+    from citylens_core.stages.change import _n_step_dilate, _one_step_dilate
+
+    rng = np.random.default_rng(7)
+    for steps in (1, 2, 3, 5, 8, 24):
+        m = rng.random((48, 52)) < 0.05
+        ref = m
+        for _ in range(steps):
+            ref = _one_step_dilate(ref)
+        got = _n_step_dilate(m, steps)
+        assert np.array_equal(got, ref), f"divergence at steps={steps}"

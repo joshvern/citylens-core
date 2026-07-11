@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -92,22 +92,28 @@ def run_sam2_auto_mask(
     cfg_path: Path,
     ckpt_path: Path,
     device: Optional[str] = None,
+    _runtime: tuple[Any, Any] | None = None,
 ) -> np.ndarray:
     """Run SAM2 automatic mask generation.
 
     Imports `sam2` only when called to keep base installs lightweight.
     """
 
-    torch, model = _build_sam2_model(cfg_path, ckpt_path, device=device)
+    owns_runtime = _runtime is None
+    torch, model = (
+        _build_sam2_model(cfg_path, ckpt_path, device=device)
+        if _runtime is None
+        else _runtime
+    )
 
     try:
-        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-    except Exception as e:  # pragma: no cover
-        raise Sam2UnavailableError(
-            "sam2 not installed; install with `pip install -e .[sam2]`"
-        ) from e
+        try:
+            from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+        except Exception as e:  # pragma: no cover
+            raise Sam2UnavailableError(
+                "sam2 not installed; install with `pip install -e .[sam2]`"
+            ) from e
 
-    try:
         # Default SAM2 AMG params allocate 10-20GB on CPU inference for a
         # 1024x1024 image — far too aggressive for a Cloud Run Job.
         # These knobs let the deployer dial the memory / quality tradeoff
@@ -137,11 +143,8 @@ def run_sam2_auto_mask(
             combined = np.logical_or(combined, np.asarray(seg, dtype=bool)).astype(np.uint8)
         return combined
     finally:
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        if owns_runtime:
+            _empty_cuda_cache(torch)
 
 
 def _label_components(mask: np.ndarray) -> tuple[np.ndarray, int]:
@@ -198,6 +201,7 @@ def run_sam2_baseline_prompted(
     cfg_path: Path,
     ckpt_path: Path,
     device: Optional[str] = None,
+    _runtime: tuple[Any, Any] | None = None,
 ) -> np.ndarray:
     """Segment `image_rgb` using SAM2ImagePredictor with per-building prompts.
 
@@ -225,20 +229,25 @@ def run_sam2_baseline_prompted(
     if not baseline.any():
         return np.zeros((h, w), dtype=np.uint8)
 
-    torch, model = _build_sam2_model(cfg_path, ckpt_path, device=device)
-
-    try:
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
-    except Exception as e:  # pragma: no cover
-        raise Sam2UnavailableError(
-            "sam2 not installed; install with `pip install -e .[sam2]`"
-        ) from e
+    owns_runtime = _runtime is None
+    torch, model = (
+        _build_sam2_model(cfg_path, ckpt_path, device=device)
+        if _runtime is None
+        else _runtime
+    )
 
     min_area = _int_env("CITYLENS_SAM2_PROMPT_MIN_AREA_PX", 40)
     max_components = _int_env("CITYLENS_SAM2_PROMPT_MAX_COMPONENTS", 200)
     box_pad = _int_env("CITYLENS_SAM2_PROMPT_BOX_PAD_PX", 8)
 
     try:
+        try:
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+        except Exception as e:  # pragma: no cover
+            raise Sam2UnavailableError(
+                "sam2 not installed; install with `pip install -e .[sam2]`"
+            ) from e
+
         predictor = SAM2ImagePredictor(model)
         predictor.set_image(image_rgb)
 
@@ -258,7 +267,16 @@ def run_sam2_baseline_prompted(
         if not comps:
             return np.zeros((h, w), dtype=np.uint8)
 
-        combined = np.zeros((h, w), dtype=bool)
+        # Build all prompts up front, then predict in CHUNKED BATCHES.
+        # The mask decoder handles batched prompts against the one set
+        # image in a single forward pass — on a 200-building tile this
+        # replaces 200 sequential predict() calls (the dominant wall-time
+        # cost of the prompted path). Chunked because returned masks are
+        # (B, 3, H, W) float32 ≈ 12 MB per prompt at 1024² — B=200
+        # unchunked would be ~2.4 GB.
+        prompt_comps: list[Any] = []
+        point_coords_all: list[list[list[float]]] = []
+        boxes_all: list[list[float]] = []
         for _area, comp_id in comps:
             comp = (labels == comp_id)
             ys, xs = np.where(comp)
@@ -266,57 +284,159 @@ def run_sam2_baseline_prompted(
             y1 = min(h, int(ys.max()) + 1 + box_pad)
             x0 = max(0, int(xs.min()) - box_pad)
             x1 = min(w, int(xs.max()) + 1 + box_pad)
+            prompt_comps.append(comp)
+            point_coords_all.append([[float(xs.mean()), float(ys.mean())]])
+            boxes_all.append([float(x0), float(y0), float(x1), float(y1)])
 
-            # Centroid of the component as a positive point prompt.
-            cy = float(ys.mean())
-            cx = float(xs.mean())
-            point_coords = np.array([[cx, cy]], dtype=np.float32)
-            point_labels = np.array([1], dtype=np.int32)
-            box = np.array([x0, y0, x1, y1], dtype=np.float32)
-
-            try:
-                masks, scores, _lowres = predictor.predict(
-                    point_coords=point_coords,
-                    point_labels=point_labels,
-                    box=box,
-                    multimask_output=True,
-                )
-            except Exception as e:
-                _logger.warning(
-                    "sam2_prompted_predict_failed",
-                    extra={"component": int(comp_id), "error": f"{type(e).__name__}: {e}"},
-                )
-                continue
-
-            if masks is None or len(masks) == 0:
-                continue
-
-            # Pick the candidate that best matches this component (highest IoU
-            # with the baseline component). Tie-break on SAM2's own score.
+        def _pick_best(cand_masks, cand_scores, comp) -> Any | None:
+            """Best-IoU-vs-component candidate; tie-break on SAM2 score."""
+            if cand_masks is None or len(cand_masks) == 0:
+                return None
             best_idx = 0
             best_iou = -1.0
             best_score = 0.0
-            for i in range(len(masks)):
-                m_i = np.asarray(masks[i], dtype=bool)
+            for i in range(len(cand_masks)):
+                m_i = np.asarray(cand_masks[i], dtype=bool)
                 if m_i.shape != (h, w):
                     continue
                 inter = np.logical_and(m_i, comp).sum()
                 union = np.logical_or(m_i, comp).sum()
                 iou = float(inter) / float(union) if union > 0 else 0.0
-                sc = float(scores[i]) if scores is not None and len(scores) > i else 0.0
+                sc = (
+                    float(cand_scores[i])
+                    if cand_scores is not None and len(cand_scores) > i
+                    else 0.0
+                )
                 if iou > best_iou or (abs(iou - best_iou) < 1e-9 and sc > best_score):
                     best_iou = iou
                     best_score = sc
                     best_idx = i
+            picked = np.asarray(cand_masks[best_idx], dtype=bool)
+            return picked if picked.shape == (h, w) else None
 
-            picked = np.asarray(masks[best_idx], dtype=bool)
-            if picked.shape == (h, w):
-                combined = np.logical_or(combined, picked)
+        batch_size = max(1, _int_env("CITYLENS_SAM2_PROMPT_BATCH_SIZE", 32))
+        combined = np.zeros((h, w), dtype=bool)
+        for start in range(0, len(prompt_comps), batch_size):
+            chunk_comps = prompt_comps[start : start + batch_size]
+            chunk_points = np.asarray(
+                point_coords_all[start : start + batch_size], dtype=np.float32
+            )
+            chunk_labels = np.ones(
+                (len(chunk_comps), 1), dtype=np.int32
+            )
+            chunk_boxes = np.asarray(
+                boxes_all[start : start + batch_size], dtype=np.float32
+            )
+            try:
+                masks, scores, _lowres = predictor.predict(
+                    point_coords=chunk_points,
+                    point_labels=chunk_labels,
+                    box=chunk_boxes,
+                    multimask_output=True,
+                )
+                masks_arr = np.asarray(masks)
+                scores_arr = np.asarray(scores) if scores is not None else None
+                # B==1 edge: predict() squeezes the batch dim → (3, H, W).
+                if len(chunk_comps) == 1 and masks_arr.ndim == 3:
+                    masks_arr = masks_arr[None, ...]
+                    if scores_arr is not None and scores_arr.ndim == 1:
+                        scores_arr = scores_arr[None, ...]
+                for bi, comp in enumerate(chunk_comps):
+                    picked = _pick_best(
+                        masks_arr[bi],
+                        scores_arr[bi] if scores_arr is not None else None,
+                        comp,
+                    )
+                    if picked is not None:
+                        combined = np.logical_or(combined, picked)
+            except Exception as e:
+                # Fall back to per-component predicts for this chunk only —
+                # preserves the old failure tolerance granularity.
+                _logger.warning(
+                    "sam2_prompted_batch_failed_falling_back",
+                    extra={
+                        "chunk_start": int(start),
+                        "chunk_size": len(chunk_comps),
+                        "error": f"{type(e).__name__}: {e}",
+                    },
+                )
+                for bi, comp in enumerate(chunk_comps):
+                    try:
+                        masks, scores, _lowres = predictor.predict(
+                            point_coords=chunk_points[bi],
+                            point_labels=chunk_labels[bi],
+                            box=chunk_boxes[bi],
+                            multimask_output=True,
+                        )
+                    except Exception as e2:
+                        _logger.warning(
+                            "sam2_prompted_predict_failed",
+                            extra={
+                                "component": int(start + bi),
+                                "error": f"{type(e2).__name__}: {e2}",
+                            },
+                        )
+                        continue
+                    picked = _pick_best(masks, scores, comp)
+                    if picked is not None:
+                        combined = np.logical_or(combined, picked)
 
         return combined.astype(np.uint8)
     finally:
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        if owns_runtime:
+            _empty_cuda_cache(torch)
+
+
+def _empty_cuda_cache(torch: Any) -> None:
+    """Best-effort release of transient CUDA allocator blocks."""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def run_sam2_prompted_with_discovery(
+    image_rgb: np.ndarray,
+    baseline_mask: np.ndarray,
+    *,
+    cfg_path: Path,
+    ckpt_path: Path,
+    device: Optional[str] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run prompted classification and automatic discovery on one model.
+
+    Both paths consume the same current image but serve different purposes:
+    prompted output scores baseline footprints, while automatic output finds
+    current-only structures.  Building SAM2 is relatively expensive, so this
+    paired entry point loads the checkpoint once and shares the model across
+    the two per-image predictors.  Image embeddings remain private to each
+    predictor/generator.
+    """
+    baseline = np.asarray(baseline_mask)
+    if baseline.shape != image_rgb.shape[:2]:
+        raise ValueError(
+            f"baseline_mask shape {baseline.shape} does not match image {image_rgb.shape[:2]}"
+        )
+
+    torch, model = _build_sam2_model(cfg_path, ckpt_path, device=device)
+    runtime = (torch, model)
+    try:
+        prompted = run_sam2_baseline_prompted(
+            image_rgb,
+            baseline,
+            cfg_path=cfg_path,
+            ckpt_path=ckpt_path,
+            device=device,
+            _runtime=runtime,
+        )
+        discovery = run_sam2_auto_mask(
+            image_rgb,
+            cfg_path=cfg_path,
+            ckpt_path=ckpt_path,
+            device=device,
+            _runtime=runtime,
+        )
+        return prompted, discovery
+    finally:
+        _empty_cuda_cache(torch)

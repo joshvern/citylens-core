@@ -502,6 +502,21 @@ def _label_components(mask: Any) -> tuple[Any, int]:
     return labels, n
 
 
+def _mask_touches_border(mask: Any) -> bool:
+    """Whether any True pixel lies on the image boundary."""
+    import numpy as np
+
+    m = np.asarray(mask).astype(bool)
+    if m.ndim != 2 or not m.any():
+        return False
+    return bool(
+        m[0, :].any()
+        or m[-1, :].any()
+        or m[:, 0].any()
+        or m[:, -1].any()
+    )
+
+
 def _polygon_coords_from_pixel_mask(
     pixel_mask: Any, *, transform: Any | None
 ) -> list[list[list[list[float]]]]:
@@ -1033,7 +1048,7 @@ def stage_change(
     # suppress the stale baseline output it supersedes (avoids emitting both
     # "unchanged old footprint" and "modified replacement" on one building).
     semantic_current_events: list[dict[str, Any]] = []
-    semantic_current_rejected = {"too_small": 0}
+    semantic_current_rejected = {"too_small": 0, "border_touching": 0}
     semantic_modified_mask = np.zeros_like(base, dtype=bool)
     semantic_current_usable = bool(
         current_source_features is not None
@@ -1070,6 +1085,11 @@ def stage_change(
             current_area_px = int(current_mask.sum())
             if current_area_px < 1:
                 continue
+            if _mask_touches_border(current_mask):
+                # Even with padded source queries, an edge-clipped geometry
+                # is incomplete evidence for a change claim.
+                semantic_current_rejected["border_touching"] += 1
+                continue
             if current_area_px < min_area_px:
                 # Apply the same commercial noise floor as generic added
                 # components before this event can suppress a baseline row.
@@ -1098,6 +1118,7 @@ def stage_change(
             )
 
     semantic_baseline_outputs_suppressed = 0
+    baseline_edge_changes_skipped = {"modified": 0, "demolished": 0}
 
     def _superseded_by_semantic_current(footprint_mask: Any) -> bool:
         """Whether a dated replacement materially covers this baseline."""
@@ -1224,6 +1245,11 @@ def stage_change(
                 local_reg_applied += 1
 
             change_type = _classify_with_lidar_rescue(iou, scoring_mask)
+            if change_type in baseline_edge_changes_skipped and _mask_touches_border(
+                scoring_mask
+            ):
+                baseline_edge_changes_skipped[change_type] += 1
+                continue
             counts[change_type] += 1
 
             area_m2_val = float(single_area_px) * px_area_m2 if px_area_m2 > 0 else None
@@ -1337,6 +1363,11 @@ def stage_change(
                 local_reg_applied += 1
 
             change_type = _classify_with_lidar_rescue(iou, comp)
+            if change_type in baseline_edge_changes_skipped and _mask_touches_border(
+                comp
+            ):
+                baseline_edge_changes_skipped[change_type] += 1
+                continue
             counts[change_type] += 1
 
             area_m2_val = float(comp_area_px) * px_area_m2 if px_area_m2 > 0 else None
@@ -1506,12 +1537,7 @@ def stage_change(
         # AMG commonly yields a huge road/background region connected to the
         # tile edge.  It is both an obvious false building and an incomplete
         # polygon, so reject it before the more expensive per-component gates.
-        if reject_border_touching and (
-            bool(comp[0, :].any())
-            or bool(comp[-1, :].any())
-            or bool(comp[:, 0].any())
-            or bool(comp[:, -1].any())
-        ):
+        if reject_border_touching and _mask_touches_border(comp):
             added_reject_reasons["border_touching"] += 1
             continue
 
@@ -1819,6 +1845,10 @@ def stage_change(
     # without parsing the geojson.
     summary.qa["change_counts"] = dict(counts)
     summary.qa["local_registration_applied"] = int(local_reg_applied)
+    summary.qa["baseline_edge_changes_skipped"] = {
+        **baseline_edge_changes_skipped,
+        "total": int(sum(baseline_edge_changes_skipped.values())),
+    }
     # Why the generic AMG/prompted added gate rejected candidates. Semantic
     # current-footprint additions bypass this noisy candidate lane and are
     # counted separately in semantic_current_change_counts.

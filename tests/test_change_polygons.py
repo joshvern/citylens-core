@@ -289,6 +289,77 @@ def test_semantic_multipolygon_emits_one_event_with_total_area(
     assert summary.qa["change_counts"]["added"] == 1
 
 
+def test_semantic_edge_added_is_rejected_while_interior_added_emits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=0, y0=5, x1=10, y1=15, construction_year=2022,
+                base_bbl="edge",
+            ),
+            _current_feature(
+                x0=20, y0=20, x1=30, y1=30, construction_year=2022,
+                base_bbl="interior",
+            ),
+        ],
+    )
+    empty = np.zeros((40, 40), dtype=np.uint8)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=empty,
+        baseline_mask=empty,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    added = [
+        feature
+        for feature in payload["features"]
+        if feature["properties"]["change_type"] == "added"
+    ]
+    assert len(added) == 1
+    assert added[0]["properties"]["base_bbl"] == "interior"
+    assert summary.qa["semantic_current_rejected"]["border_touching"] == 1
+    assert summary.qa["semantic_current_change_counts"]["added"] == 1
+    assert summary.qa["change_counts"]["added"] == 1
+
+
+def test_rejected_semantic_edge_modified_preserves_unchanged_presence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=0, y0=5, x1=10, y1=15, construction_year=2022
+            )
+        ],
+    )
+    base = np.zeros((25, 25), dtype=np.uint8)
+    base[5:15, 0:10] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=base,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert [f["properties"]["change_type"] for f in payload["features"]] == [
+        "unchanged"
+    ]
+    assert summary.qa["semantic_current_rejected"]["border_touching"] == 1
+    assert summary.qa["semantic_current_change_counts"]["modified"] == 0
+    assert summary.qa["baseline_edge_changes_skipped"]["total"] == 0
+    assert summary.qa["change_counts"]["unchanged"] == 1
+
+
 def test_pre_baseline_current_footprint_is_not_falsely_added(
     tmp_path: Path,
 ) -> None:
@@ -426,6 +497,37 @@ def test_demolished_building_gets_demolished_feature(tmp_path: Path, monkeypatch
     assert kinds == ["demolished"]
     assert payload["features"][0]["properties"]["baseline_iou"] < 0.2
     assert summary.qa["change_counts"]["demolished"] == 1
+
+
+def test_component_path_skips_edge_modified_but_keeps_interior_modified(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CITYLENS_CHANGE_REGISTRATION_MAX_SHIFT_PX", "0")
+    monkeypatch.setenv("CITYLENS_CHANGE_LOCAL_REGISTRATION_MAX_SHIFT_PX", "0")
+    base = np.zeros((40, 40), dtype=np.uint8)
+    current = np.zeros_like(base)
+    # Edge and interior baselines both have 30% current coverage -> modified.
+    base[5:15, 0:10] = 1
+    current[5:15, 0:3] = 1
+    base[22:32, 22:32] = 1
+    current[22:32, 22:25] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=current,
+        baseline_mask=base,
+    )
+
+    assert summary.qa["change_source"] == "component_labeled"
+    assert [f["properties"]["change_type"] for f in payload["features"]] == [
+        "modified"
+    ]
+    assert summary.qa["baseline_edge_changes_skipped"] == {
+        "modified": 1,
+        "demolished": 0,
+        "total": 1,
+    }
+    assert summary.qa["change_counts"]["modified"] == 1
 
 
 def test_added_building_gets_added_feature(tmp_path: Path, monkeypatch) -> None:
@@ -788,6 +890,53 @@ def test_per_source_feature_splits_adjacent_row_houses(tmp_path: Path, monkeypat
         assert f["properties"].get("SourceDate") == "2017-01-01"
         # Provenance doesn't shadow computed fields.
         assert f["properties"]["change_type"] == "unchanged"
+
+
+def test_per_source_path_skips_edge_demolition_but_keeps_interior_demolition(
+    tmp_path: Path,
+) -> None:
+    edge = {
+        "type": "Feature",
+        "properties": {"Source": "edge"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[0, 5], [10, 5], [10, 15], [0, 15], [0, 5]]],
+        },
+    }
+    interior = {
+        "type": "Feature",
+        "properties": {"Source": "interior"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [
+                [[22, 22], [32, 22], [32, 32], [22, 32], [22, 22]]
+            ],
+        },
+    }
+    _write_baseline_geojson(tmp_path, [edge, interior])
+    base = np.zeros((40, 40), dtype=np.uint8)
+    base[5:15, 0:10] = 1
+    base[22:32, 22:32] = 1
+    current = np.zeros_like(base)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=current,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert summary.qa["change_source"] == "per_source_feature"
+    assert len(payload["features"]) == 1
+    assert payload["features"][0]["properties"]["change_type"] == "demolished"
+    assert payload["features"][0]["properties"]["Source"] == "interior"
+    assert summary.qa["baseline_edge_changes_skipped"] == {
+        "modified": 0,
+        "demolished": 1,
+        "total": 1,
+    }
+    assert summary.qa["change_counts"]["demolished"] == 1
 
 
 def test_per_source_feature_fallback_when_no_geojson(tmp_path: Path, monkeypatch) -> None:

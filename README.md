@@ -115,7 +115,9 @@ print(artifacts)
   `base_bbl`, `mappluto_bbl`, and `source_dataset` properties are forwarded as
   provenance. When usable, its rasterized union is preferred for current
   building presence and dated post-baseline features directly produce
-  `added`/`modified` events. A valid empty collection is authoritative.
+  `added`/`modified` events subject to the same 60 m² commercial noise floor
+  as generic discovery. A source MultiPolygon remains one event with its total
+  rasterized area. A valid empty collection is authoritative.
 - Without semantic current footprints, prompted `change` runs also run
   automatic SAM2 on the current orthophoto for added-building discovery. The
   masks stay separate: prompted output drives existing-footprint IoU while the

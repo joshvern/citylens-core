@@ -193,6 +193,102 @@ def test_post_baseline_expansion_emits_modified_and_supersedes_old_footprint(
     }
 
 
+def test_tiny_semantic_added_respects_commercial_area_floor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("CITYLENS_CHANGE_MIN_AREA_M2", raising=False)
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=10, y0=10, x1=15, y1=15, construction_year=2022
+            )
+        ],
+    )
+    empty = np.zeros((30, 30), dtype=np.uint8)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=empty,
+        baseline_mask=empty,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert payload["features"] == []
+    assert summary.qa["semantic_current_change_counts"]["added"] == 0
+    assert summary.qa["semantic_current_rejected"]["too_small"] == 1
+    assert summary.qa["change_counts"]["added"] == 0
+
+
+def test_tiny_semantic_modified_does_not_suppress_baseline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("CITYLENS_CHANGE_MIN_AREA_M2", raising=False)
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=10, y0=10, x1=15, y1=15, construction_year=2022
+            )
+        ],
+    )
+    base = np.zeros((30, 30), dtype=np.uint8)
+    base[10:15, 10:15] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=base,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert [f["properties"]["change_type"] for f in payload["features"]] == [
+        "unchanged"
+    ]
+    assert summary.qa["semantic_current_change_counts"]["modified"] == 0
+    assert summary.qa["semantic_current_rejected"]["too_small"] == 1
+    assert summary.qa["semantic_baseline_outputs_suppressed"] == 0
+
+
+def test_semantic_multipolygon_emits_one_event_with_total_area(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("CITYLENS_CHANGE_MIN_AREA_M2", raising=False)
+    feature = _current_feature(
+        x0=0, y0=0, x1=1, y1=1, construction_year=2022
+    )
+    feature["geometry"] = {
+        "type": "MultiPolygon",
+        "coordinates": [
+            [[[2, 2], [10, 2], [10, 10], [2, 10], [2, 2]]],
+            [[[20, 20], [28, 20], [28, 28], [20, 28], [20, 20]]],
+        ],
+    }
+    _write_current_footprints(tmp_path, [feature])
+    empty = np.zeros((40, 40), dtype=np.uint8)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=empty,
+        baseline_mask=empty,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert len(payload["features"]) == 1
+    emitted = payload["features"][0]
+    assert emitted["geometry"]["type"] == "MultiPolygon"
+    assert len(emitted["geometry"]["coordinates"]) == 2
+    assert emitted["properties"]["area_m2"] == 128.0
+    assert summary.qa["semantic_current_change_counts"] == {
+        "added": 1,
+        "modified": 0,
+    }
+    assert summary.qa["change_counts"]["added"] == 1
+
+
 def test_pre_baseline_current_footprint_is_not_falsely_added(
     tmp_path: Path,
 ) -> None:

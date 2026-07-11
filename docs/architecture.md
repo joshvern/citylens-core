@@ -18,7 +18,8 @@ The pipeline is implemented as a sequence of stages:
    plus the already-ortho-CRS `current_footprints.geojson`
 5. `change` – prefer the semantic current-footprint union for baseline presence;
    emit dated post-baseline current features as source-aware `added` or
-   `modified` events; otherwise fall back to SAM discovery; produce
+   `modified` events after the shared area floor (preserving MultiPolygon
+   source features as one event); otherwise fall back to SAM discovery; produce
    `change.geojson` in pixel space or georeferenced coordinates
 6. `reconstruct` – produce `mesh.ply`; use `work_dir/lidar.las` as the primary geometry source and fall back to mask heights
 7. `render` – produce `preview.png`

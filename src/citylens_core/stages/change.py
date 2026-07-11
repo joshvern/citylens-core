@@ -588,7 +588,7 @@ def _pixel_area_m2(transform: Any | None, crs_value: str | None) -> float:
 def _feature(
     *,
     change_type: str,
-    coordinates: list[list[list[float]]],
+    coordinates: Any,
     area_m2: float | None,
     baseline_iou: float | None,
     imagery_year: int,
@@ -599,6 +599,7 @@ def _feature(
     confidence: float | None = None,
     surface_delta_e_value: float | None = None,
     surface_changed: bool | None = None,
+    geometry_type: str = "Polygon",
 ) -> dict[str, Any]:
     props: dict[str, Any] = {
         "change_type": change_type,
@@ -637,7 +638,7 @@ def _feature(
     return {
         "type": "Feature",
         "properties": props,
-        "geometry": {"type": "Polygon", "coordinates": coordinates},
+        "geometry": {"type": geometry_type, "coordinates": coordinates},
     }
 
 
@@ -750,19 +751,6 @@ def _extract_current_source_provenance(source_props: Any) -> dict[str, Any]:
         out["construction_year"] = year
     out["current_footprint_semantic"] = True
     return out
-
-
-def _polygon_parts(geom: Any) -> list[list[list[list[float]]]]:
-    """Return Polygon coordinate arrays from Polygon/MultiPolygon GeoJSON."""
-    if not isinstance(geom, dict):
-        return []
-    geom_type = str(geom.get("type", "")).strip()
-    coords = geom.get("coordinates")
-    if geom_type == "Polygon" and coords:
-        return [coords]
-    if geom_type == "MultiPolygon" and coords:
-        return list(coords)
-    return []
 
 
 def _best_local_iou(
@@ -1045,6 +1033,7 @@ def stage_change(
     # suppress the stale baseline output it supersedes (avoids emitting both
     # "unchanged old footprint" and "modified replacement" on one building).
     semantic_current_events: list[dict[str, Any]] = []
+    semantic_current_rejected = {"too_small": 0}
     semantic_modified_mask = np.zeros_like(base, dtype=bool)
     semantic_current_usable = bool(
         current_source_features is not None
@@ -1067,8 +1056,11 @@ def stage_change(
             ):
                 continue
             current_geom = current_feature.get("geometry")
-            polygon_parts = _polygon_parts(current_geom)
-            if not polygon_parts:
+            if not isinstance(current_geom, dict):
+                continue
+            geometry_type = str(current_geom.get("type", "")).strip()
+            coordinates = current_geom.get("coordinates")
+            if geometry_type not in ("Polygon", "MultiPolygon") or not coordinates:
                 continue
             current_mask = _rasterize_single_geom(
                 current_geom,
@@ -1077,6 +1069,11 @@ def stage_change(
             )
             current_area_px = int(current_mask.sum())
             if current_area_px < 1:
+                continue
+            if current_area_px < min_area_px:
+                # Apply the same commercial noise floor as generic added
+                # components before this event can suppress a baseline row.
+                semantic_current_rejected["too_small"] += 1
                 continue
             baseline_overlap_px = int(np.logical_and(current_mask, base).sum())
             baseline_overlap_fraction = (
@@ -1092,10 +1089,10 @@ def stage_change(
             semantic_current_events.append(
                 {
                     "change_type": semantic_change_type,
-                    "mask": current_mask,
                     "area_px": current_area_px,
                     "baseline_overlap_fraction": baseline_overlap_fraction,
-                    "polygon_parts": polygon_parts,
+                    "geometry_type": geometry_type,
+                    "coordinates": coordinates,
                     "properties": current_props,
                 }
             )
@@ -1424,21 +1421,25 @@ def stage_change(
             if semantic_change_type == "added"
             else _current_source_modified_confidence()
         )
-        for coordinates in semantic_event["polygon_parts"]:
-            features.append(
-                _feature(
-                    change_type=semantic_change_type,
-                    coordinates=coordinates,
-                    area_m2=semantic_area_m2,
-                    baseline_iou=None,
-                    imagery_year=request.imagery_year,
-                    baseline_year=request.baseline_year,
-                    crs_value=crs_value,
-                    extra_props=semantic_props,
-                    confidence=semantic_confidence,
-                )
+        # Preserve one source feature as one event. In particular, a
+        # MultiPolygon keeps one total area and increments counts once rather
+        # than emitting N Polygon rows that each claim the whole-feature area.
+        features.append(
+            _feature(
+                change_type=semantic_change_type,
+                coordinates=semantic_event["coordinates"],
+                area_m2=semantic_area_m2,
+                baseline_iou=None,
+                imagery_year=request.imagery_year,
+                baseline_year=request.baseline_year,
+                crs_value=crs_value,
+                extra_props=semantic_props,
+                confidence=semantic_confidence,
+                geometry_type=str(semantic_event["geometry_type"]),
             )
+        )
     summary.qa["semantic_current_change_counts"] = semantic_current_counts
+    summary.qa["semantic_current_rejected"] = semantic_current_rejected
     summary.qa["semantic_baseline_outputs_suppressed"] = int(
         semantic_baseline_outputs_suppressed
     )

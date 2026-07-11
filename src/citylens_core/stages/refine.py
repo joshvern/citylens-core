@@ -7,8 +7,30 @@ import numpy as np
 import rasterio
 
 from ..models import CitylensRequest, PipelineSummary
-from ..io.geo import clean_binary_mask, geojson_crs_hint, load_geojson_mask
+from ..io.geo import (
+    binary_mask_stats,
+    clean_binary_mask,
+    geojson_crs_hint,
+    load_geojson_mask,
+)
 from ..io.lidar import sample_lidar_heights
+
+
+def _refine_segmentation_mask(mask: Any) -> np.ndarray:
+    """Apply the standard deterministic cleanup to a segmentation mask."""
+    mask_array = np.asarray(mask)
+    min_dim = min(int(mask_array.shape[0]), int(mask_array.shape[1]))
+    morph_radius = 1 if min_dim >= 9 else 0
+    min_component_px = max(
+        1 if min_dim < 9 else 4,
+        int(round(mask_array.size * 0.00001)),
+    )
+    return clean_binary_mask(
+        mask_array.astype(bool),
+        open_radius=morph_radius,
+        close_radius=morph_radius,
+        min_component_px=min_component_px,
+    ).astype(np.uint8)
 
 
 def _load_orthophoto_geometry(ctx: dict[str, Any], work_dir: Path) -> tuple[tuple[int, int] | None, Any | None, str | None]:
@@ -49,15 +71,29 @@ def stage_refine(
         raise RuntimeError("refine stage requires a segmentation mask")
 
     shape, transform, crs = _load_orthophoto_geometry(ctx, work_dir)
-    min_dim = min(int(np.asarray(mask).shape[0]), int(np.asarray(mask).shape[1]))
-    morph_radius = 1 if min_dim >= 9 else 0
-    min_component_px = max(1 if min_dim < 9 else 4, int(round(np.asarray(mask).size * 0.00001)))
-    refined_mask = clean_binary_mask(
-        np.asarray(mask).astype(bool),
-        open_radius=morph_radius,
-        close_radius=morph_radius,
-        min_component_px=min_component_px,
-    ).astype(np.uint8)
+    refined_mask = _refine_segmentation_mask(mask)
+
+    added_discovery_mask = ctx.get("added_discovery_mask")
+    refined_added_discovery_mask = None
+    if added_discovery_mask is not None:
+        if added_discovery_mask is mask:
+            # In primary-auto mode the segmentation and discovery masks are
+            # deliberately the same array.  Reuse the cleaned result.
+            refined_added_discovery_mask = refined_mask
+        else:
+            discovery_shape = np.asarray(added_discovery_mask).shape
+            if discovery_shape != np.asarray(mask).shape:
+                raise RuntimeError(
+                    "discovery mask shape "
+                    f"{discovery_shape} does not match segmentation mask "
+                    f"{np.asarray(mask).shape}"
+                )
+            refined_added_discovery_mask = _refine_segmentation_mask(
+                added_discovery_mask
+            )
+        summary.qa["sam2_added_discovery_refined"] = binary_mask_stats(
+            refined_added_discovery_mask
+        )
 
     baseline_mask = ctx.get("baseline_mask")
     refined_baseline_mask = None
@@ -98,6 +134,7 @@ def stage_refine(
     out = {
         **ctx,
         "refined_mask": refined_mask,
+        "refined_added_discovery_mask": refined_added_discovery_mask,
         "refined_baseline_mask": refined_baseline_mask,
     }
     if baseline_footprints_mask is not None:

@@ -279,6 +279,19 @@ def _added_max_baseline_overlap() -> float:
     return _float_env("CITYLENS_CHANGE_ADDED_MAX_BASELINE_OVERLAP", 0.1)
 
 
+def _added_reject_border_touching() -> bool:
+    """Reject incomplete/noisy discovery components clipped by the tile.
+
+    Automatic segmentation often emits one large road, water, or background
+    region connected to an image edge.  With baseline-epoch LiDAR that flat
+    region can otherwise look like strong evidence of new construction.
+    Border-clipped buildings are not reliable complete footprints either, so
+    the conservative production default is to reject them.  The switch keeps
+    controlled ablations possible.
+    """
+    return _bool_env("CITYLENS_CHANGE_ADDED_REJECT_BORDER_TOUCHING", True)
+
+
 def _added_max_baseline_epoch_height_m() -> float:
     """LiDAR height gate on 'added' components — BASELINE-EPOCH semantics.
 
@@ -807,6 +820,26 @@ def stage_change(
     im = np.asarray(imagery_mask).astype(bool)
     base = np.asarray(baseline_mask).astype(bool)
 
+    # The high-precision prompted mask above remains the sole input to every
+    # baseline-footprint IoU.  When segmentation supplied a separate
+    # current-image automatic discovery mask, use it only for the added pass.
+    # Auto mode supplies its primary mask under the same key, so this remains
+    # one code path without paying for duplicate automatic inference.
+    discovery_mask = ctx.get("refined_added_discovery_mask")
+    added_mask_source = "refined_added_discovery_mask"
+    if discovery_mask is None:
+        discovery_mask = ctx.get("added_discovery_mask")
+        added_mask_source = "added_discovery_mask"
+    if discovery_mask is None:
+        discovery_mask = imagery_mask
+        added_mask_source = "imagery_mask"
+    added_im = np.asarray(discovery_mask).astype(bool)
+    if added_im.shape != im.shape:
+        raise RuntimeError(
+            f"discovery mask shape {added_im.shape} does not match imagery mask {im.shape}"
+        )
+    summary.qa["added_mask_source"] = added_mask_source
+
     # ------------------------------------------------------------------
     # Sub-pixel registration (#1). Estimate one global (dy, dx) shift
     # that aligns the baseline mask to the current mask. Recovers the
@@ -1151,8 +1184,12 @@ def stage_change(
     added_baseline_dilate_px = _added_baseline_dilate_px()
     added_max_inside_dilation_frac = _added_max_inside_dilation_frac()
     added_exg_threshold = _added_exg_vegetation_threshold()
+    reject_border_touching = (
+        _added_reject_border_touching() and added_mask_source != "imagery_mask"
+    )
     added_reject_reasons = {
         "too_small": 0,
+        "border_touching": 0,
         "baseline_overlap": 0,
         "centroid_near_baseline": 0,
         "majority_inside_baseline_dilation": 0,
@@ -1183,13 +1220,25 @@ def stage_change(
         else None
     )
 
-    added_pixels = np.logical_and(im, np.logical_not(base))
+    added_pixels = np.logical_and(added_im, np.logical_not(base))
     added_labels, added_n = _label_components(added_pixels)
     for comp_id in range(1, added_n + 1):
         comp = added_labels == comp_id
         comp_area_px = int(comp.sum())
         if comp_area_px < min_area_px:
             added_reject_reasons["too_small"] += 1
+            continue
+
+        # AMG commonly yields a huge road/background region connected to the
+        # tile edge.  It is both an obvious false building and an incomplete
+        # polygon, so reject it before the more expensive per-component gates.
+        if reject_border_touching and (
+            bool(comp[0, :].any())
+            or bool(comp[-1, :].any())
+            or bool(comp[:, 0].any())
+            or bool(comp[:, -1].any())
+        ):
+            added_reject_reasons["border_touching"] += 1
             continue
 
         # Reject slivers along existing baseline buildings.
@@ -1501,9 +1550,15 @@ def stage_change(
     # change_counts["added"].
     summary.qa["added_rejected"] = dict(added_reject_reasons)
 
-    change_mask = np.logical_or(
+    classification_change_mask = np.logical_or(
         np.logical_and(im, np.logical_not(base)),
         np.logical_and(base, np.logical_not(im)),
+    )
+    # Include current-only discovery pixels in the coarse downstream change
+    # mask, while keeping them out of the baseline IoU classifier above.
+    change_mask = np.logical_or(
+        classification_change_mask,
+        np.logical_and(added_im, np.logical_not(base)),
     ).astype(np.uint8)
     return {**ctx, "change_path": out_path, "change_mask": change_mask}
 

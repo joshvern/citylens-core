@@ -8,11 +8,18 @@ The pipeline is implemented as a sequence of stages:
 
 1. `resolve` – validate request and set up `work_dir`
 2. `fetch` – resolve local inputs or download explicit URLs into `work_dir`; record raster metadata when available
-3. `segment` – run SAM2 on the orthophoto and optional baseline mask
-4. `refine` – normalize masks, clean morphology, and optionally rasterize `baseline_footprints.geojson` guidance
+3. `segment` – run SAM2 on the orthophoto and optional baseline mask. Prompted
+   change runs keep two current-image masks: a baseline-prompted classification
+   mask and a separate automatic added-building discovery mask. The paired path
+   shares one SAM2 model load.
+4. `refine` – independently normalize the classification/discovery masks,
+   clean morphology, and optionally rasterize
+   `baseline_footprints.geojson` guidance
 5. `change` – produce `change.geojson` in pixel space or georeferenced coordinates, depending on input metadata
 6. `reconstruct` – produce `mesh.ply`; use `work_dir/lidar.las` as the primary geometry source and fall back to mask heights
 7. `render` – produce `preview.png`
 
 Failures are recorded into `run_summary.json`. The pipeline does not write placeholder artifacts.
 Successful summaries also carry `qa` and `performance` sections for downstream parity tracking.
+Discovery QA includes its source/status plus raw and refined coverage,
+component count, and largest-component diagnostics.

@@ -117,6 +117,118 @@ def test_added_building_gets_added_feature(tmp_path: Path, monkeypatch) -> None:
     assert summary.qa["change_counts"]["added"] == 1
 
 
+def test_separate_discovery_finds_added_without_changing_baseline_classification(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Prompted IoU and automatic added discovery remain independent.
+
+    The prompted mask contains only the unchanged baseline building.  The
+    discovery mask deliberately omits that building and contains only a new
+    isolated roof.  Replacing the prompted mask with discovery would classify
+    the baseline as demolished; ignoring discovery would miss the addition.
+    """
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "4")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", "4")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    prompted = np.zeros((40, 40), dtype=np.uint8)
+    discovery = np.zeros((40, 40), dtype=np.uint8)
+    base[3:11, 3:11] = 1
+    prompted[3:11, 3:11] = 1
+    discovery[28:35, 28:35] = 1
+
+    payload, summary, out = _run_stage(
+        tmp_path,
+        mask=prompted,
+        baseline_mask=base,
+        ctx_extra={"refined_added_discovery_mask": discovery},
+    )
+
+    kinds = [f["properties"]["change_type"] for f in payload["features"]]
+    assert kinds.count("unchanged") == 1
+    assert kinds.count("added") == 1
+    assert "demolished" not in kinds
+    assert summary.qa["added_mask_source"] == "refined_added_discovery_mask"
+    assert out["change_mask"][30, 30] == 1
+
+    # Without the discovery key, the same prompted mask cannot contain the
+    # genuinely new component and therefore emits no added feature.
+    payload_without, summary_without, _ = _run_stage(
+        tmp_path,
+        mask=prompted,
+        baseline_mask=base,
+    )
+    kinds_without = [
+        f["properties"]["change_type"] for f in payload_without["features"]
+    ]
+    assert kinds_without == ["unchanged"]
+    assert summary_without.qa["change_counts"]["added"] == 0
+
+
+def test_discovery_component_still_uses_added_lidar_gate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Baseline-epoch flat LiDAR confirms a discovery-only addition."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "4")
+    monkeypatch.setenv("CITYLENS_CHANGE_ADDED_BASELINE_DILATE_PX", "4")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    prompted = np.zeros((40, 40), dtype=np.uint8)
+    discovery = np.zeros((40, 40), dtype=np.uint8)
+    base[3:11, 3:11] = 1
+    prompted[3:11, 3:11] = 1
+    discovery[28:35, 28:35] = 1
+    lidar = np.zeros((40, 40), dtype=np.float32)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=prompted,
+        baseline_mask=base,
+        ctx_extra={
+            "refined_added_discovery_mask": discovery,
+            "lidar_heights": lidar,
+            "lidar_ground_z": 0.0,
+        },
+    )
+
+    added = [
+        f for f in payload["features"] if f["properties"]["change_type"] == "added"
+    ]
+    assert len(added) == 1
+    assert added[0]["properties"]["baseline_lidar_flat"] is True
+    assert added[0]["properties"]["confidence"] >= 0.85
+    assert summary.qa["change_counts"]["added"] == 1
+
+
+def test_border_touching_discovery_blob_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A tile-scale AMG road/background blob must not become an addition."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_PX", "4")
+
+    base = np.zeros((40, 40), dtype=np.uint8)
+    prompted = np.zeros((40, 40), dtype=np.uint8)
+    discovery = np.zeros((40, 40), dtype=np.uint8)
+    base[20:28, 20:28] = 1
+    prompted[20:28, 20:28] = 1
+    discovery[0:12, 0:35] = 1
+    lidar = np.zeros((40, 40), dtype=np.float32)
+
+    _, summary, _ = _run_stage(
+        tmp_path,
+        mask=prompted,
+        baseline_mask=base,
+        ctx_extra={
+            "refined_added_discovery_mask": discovery,
+            "lidar_heights": lidar,
+            "lidar_ground_z": 0.0,
+        },
+    )
+
+    assert summary.qa["change_counts"]["added"] == 0
+    assert summary.qa["added_rejected"]["border_touching"] == 1
+
+
 def test_sliver_along_baseline_edge_is_NOT_flagged_as_added(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -544,6 +656,7 @@ def test_lidar_height_gate_skipped_when_lidar_absent(
     assert summary.qa["change_counts"]["added"] == 1
     assert summary.qa["added_rejected"] == {
         "too_small": 0,
+        "border_touching": 0,
         "baseline_overlap": 0,
         "centroid_near_baseline": 0,
         "majority_inside_baseline_dilation": 0,

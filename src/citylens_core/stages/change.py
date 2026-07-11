@@ -6,12 +6,13 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ..io.geo import binary_mask_stats
 from ..models import CitylensRequest, PipelineSummary
 from ._polygon_smoothing import (
     estimate_pixel_tolerance_in_world_units,
     simplify_polygon_coords,
 )
-from ._registration import apply_shift, estimate_alignment
+from ._registration import RegistrationResult, apply_shift, estimate_alignment
 from ._surface_change import (
     _load_rgb,
     is_surface_changed,
@@ -290,6 +291,16 @@ def _added_reject_border_touching() -> bool:
     controlled ablations possible.
     """
     return _bool_env("CITYLENS_CHANGE_ADDED_REJECT_BORDER_TOUCHING", True)
+
+
+def _current_source_added_confidence() -> float:
+    """Confidence for a dated semantic footprint in baseline-empty space."""
+    return _float_env("CITYLENS_CHANGE_CURRENT_SOURCE_ADDED_CONFIDENCE", 0.9)
+
+
+def _current_source_modified_confidence() -> float:
+    """Confidence for a dated footprint overlapping/replacing a baseline."""
+    return _float_env("CITYLENS_CHANGE_CURRENT_SOURCE_MODIFIED_CONFIDENCE", 0.85)
 
 
 def _added_max_baseline_epoch_height_m() -> float:
@@ -635,10 +646,14 @@ def _feature(
 # ----------------------------------------------------------------------
 
 
-def _load_baseline_source_features(work_dir: Path) -> list[dict[str, Any]] | None:
-    """Load baseline_footprints.geojson features when the worker materialized
-    one. Returns None when the file doesn't exist (tests, non-NYC paths)."""
-    gj_path = work_dir / "baseline_footprints.geojson"
+def _load_source_features(path: Path) -> list[dict[str, Any]] | None:
+    """Load a local GeoJSON FeatureCollection without any external I/O.
+
+    ``None`` means absent/invalid and enables the caller's fallback. A valid
+    empty collection returns ``[]`` because an authoritative source may
+    intentionally attest that no buildings exist in the AOI.
+    """
+    gj_path = Path(path)
     if not gj_path.exists():
         return None
     try:
@@ -647,10 +662,22 @@ def _load_baseline_source_features(work_dir: Path) -> list[dict[str, Any]] | Non
         return None
     if not isinstance(payload, dict):
         return None
+    if payload.get("type") != "FeatureCollection":
+        return None
     feats = payload.get("features")
     if not isinstance(feats, list):
         return None
     return [f for f in feats if isinstance(f, dict) and f.get("geometry")]
+
+
+def _load_baseline_source_features(work_dir: Path) -> list[dict[str, Any]] | None:
+    """Load staged baseline building features when available."""
+    return _load_source_features(work_dir / "baseline_footprints.geojson")
+
+
+def _load_current_source_features(work_dir: Path) -> list[dict[str, Any]] | None:
+    """Load optional semantic current buildings from the local work dir."""
+    return _load_source_features(work_dir / "current_footprints.geojson")
 
 
 def _rasterize_single_geom(
@@ -690,6 +717,52 @@ def _extract_source_provenance(source_props: Any) -> dict[str, Any]:
         return {}
     keep = ("source_gdb", "source_layer", "Source", "SourceDate", "NYSGeo_Source")
     return {k: source_props[k] for k in keep if k in source_props}
+
+
+def _construction_year(source_props: Any) -> int | None:
+    """Normalize a source construction year, rejecting bools/junk."""
+    if not isinstance(source_props, dict):
+        return None
+    raw = source_props.get("construction_year")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        year = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
+    return year if 1000 <= year <= 9999 else None
+
+
+def _extract_current_source_provenance(source_props: Any) -> dict[str, Any]:
+    """Forward the stable semantic-current-footprint provenance contract."""
+    if not isinstance(source_props, dict):
+        return {"current_footprint_semantic": True}
+    keep = (
+        "last_status_type",
+        "geom_source",
+        "base_bbl",
+        "mappluto_bbl",
+        "source_dataset",
+    )
+    out = {k: source_props[k] for k in keep if k in source_props}
+    year = _construction_year(source_props)
+    if year is not None:
+        out["construction_year"] = year
+    out["current_footprint_semantic"] = True
+    return out
+
+
+def _polygon_parts(geom: Any) -> list[list[list[list[float]]]]:
+    """Return Polygon coordinate arrays from Polygon/MultiPolygon GeoJSON."""
+    if not isinstance(geom, dict):
+        return []
+    geom_type = str(geom.get("type", "")).strip()
+    coords = geom.get("coordinates")
+    if geom_type == "Polygon" and coords:
+        return [coords]
+    if geom_type == "MultiPolygon" and coords:
+        return list(coords)
+    return []
 
 
 def _best_local_iou(
@@ -820,11 +893,49 @@ def stage_change(
     im = np.asarray(imagery_mask).astype(bool)
     base = np.asarray(baseline_mask).astype(bool)
 
-    # The high-precision prompted mask above remains the sole input to every
-    # baseline-footprint IoU.  When segmentation supplied a separate
-    # current-image automatic discovery mask, use it only for the added pass.
-    # Auto mode supplies its primary mask under the same key, so this remains
-    # one code path without paying for duplicate automatic inference.
+    # A staged current-footprint FeatureCollection is the preferred semantic
+    # source for "does a building exist now?" It is already in the ortho CRS.
+    # Keep `im` as the SAM mask for pipeline QA/preview consumers, but classify
+    # baseline presence against this vector-derived mask when available.
+    current_source_features = _load_current_source_features(work_dir)
+    current_footprints_mask = ctx.get("current_footprints_mask")
+    if (
+        current_footprints_mask is None
+        and current_source_features is not None
+        and transform is not None
+    ):
+        current_union = np.zeros_like(im, dtype=bool)
+        for current_feature in current_source_features:
+            current_union |= _rasterize_single_geom(
+                current_feature.get("geometry"),
+                out_shape=im.shape,
+                transform=transform,
+            )
+        current_footprints_mask = current_union
+
+    if current_footprints_mask is not None:
+        current_presence = np.asarray(current_footprints_mask).astype(bool)
+        if current_presence.shape != im.shape:
+            raise RuntimeError(
+                "current footprints mask shape "
+                f"{current_presence.shape} does not match imagery mask {im.shape}"
+            )
+        classification_im = current_presence
+        summary.qa["current_footprints_used"] = True
+        summary.qa["current_presence_source"] = "current_footprints"
+        summary.qa["current_footprints_mask"] = binary_mask_stats(current_presence)
+    else:
+        classification_im = im
+        summary.qa["current_footprints_used"] = False
+        summary.qa["current_presence_source"] = "sam2"
+    summary.qa["current_footprint_feature_count"] = (
+        len(current_source_features) if current_source_features is not None else 0
+    )
+
+    # This discovery mask is separate from baseline-presence classification:
+    # semantic current footprints (preferred) or prompted SAM drive existing
+    # footprints, while AMG is only a generic-added fallback. Auto mode aliases
+    # its primary mask here without paying for duplicate automatic inference.
     discovery_mask = ctx.get("refined_added_discovery_mask")
     added_mask_source = "refined_added_discovery_mask"
     if discovery_mask is None:
@@ -848,13 +959,32 @@ def stage_change(
     # If the phase-correlation peak isn't confident enough or the IoU
     # gain is trivial, the shift is NOT applied — defensive default.
     # ------------------------------------------------------------------
-    registration = estimate_alignment(
-        base,
-        im,
-        max_shift_px=_registration_max_shift_px(),
-        min_confidence=_registration_min_confidence(),
-        min_iou_gain=_registration_min_iou_gain(),
-    )
+    if current_footprints_mask is not None:
+        # Both semantic layers are already on the orthophoto grid. Preserve
+        # source geometry exactly and avoid an unnecessary full-tile FFT.
+        semantic_intersection = int(np.logical_and(base, classification_im).sum())
+        semantic_union = int(np.logical_or(base, classification_im).sum())
+        semantic_iou = (
+            float(semantic_intersection) / float(semantic_union)
+            if semantic_union
+            else 1.0
+        )
+        registration = RegistrationResult(
+            dy=0.0,
+            dx=0.0,
+            confidence=1.0,
+            iou_before=semantic_iou,
+            iou_after=semantic_iou,
+            accepted=False,
+        )
+    else:
+        registration = estimate_alignment(
+            base,
+            classification_im,
+            max_shift_px=_registration_max_shift_px(),
+            min_confidence=_registration_min_confidence(),
+            min_iou_gain=_registration_min_iou_gain(),
+        )
     summary.qa["registration"] = {
         "dy": registration.dy,
         "dx": registration.dx,
@@ -862,6 +992,11 @@ def stage_change(
         "iou_before": round(registration.iou_before, 4),
         "iou_after": round(registration.iou_after, 4),
         "applied": bool(registration.accepted),
+        "mode": (
+            "semantic_exact"
+            if current_footprints_mask is not None
+            else "image_registration"
+        ),
         # True when the estimated shift hit the ± cap — the real
         # misregistration may be larger than what was corrected; expect
         # residual false 'modified' on such tiles.
@@ -904,6 +1039,81 @@ def stage_change(
 
     features: list[dict[str, Any]] = []
     counts = {"unchanged": 0, "modified": 0, "demolished": 0, "added": 0}
+
+    # Dated semantic current footprints are direct change evidence. Build the
+    # event records before baseline classification so a replacement can
+    # suppress the stale baseline output it supersedes (avoids emitting both
+    # "unchanged old footprint" and "modified replacement" on one building).
+    semantic_current_events: list[dict[str, Any]] = []
+    semantic_modified_mask = np.zeros_like(base, dtype=bool)
+    semantic_current_usable = bool(
+        current_source_features is not None
+        and current_footprints_mask is not None
+        and transform is not None
+    )
+    generic_added_fallback_used = not semantic_current_usable
+    if semantic_current_usable:
+        added_mask_source = "current_footprints"
+        summary.qa["added_mask_source"] = added_mask_source
+    summary.qa["generic_added_fallback_used"] = generic_added_fallback_used
+    if semantic_current_usable:
+        for current_feature in current_source_features:
+            current_props = current_feature.get("properties")
+            construction_year = _construction_year(current_props)
+            if (
+                construction_year is None
+                or construction_year <= request.baseline_year
+                or construction_year > request.imagery_year
+            ):
+                continue
+            current_geom = current_feature.get("geometry")
+            polygon_parts = _polygon_parts(current_geom)
+            if not polygon_parts:
+                continue
+            current_mask = _rasterize_single_geom(
+                current_geom,
+                out_shape=base.shape,
+                transform=transform,
+            )
+            current_area_px = int(current_mask.sum())
+            if current_area_px < 1:
+                continue
+            baseline_overlap_px = int(np.logical_and(current_mask, base).sum())
+            baseline_overlap_fraction = (
+                float(baseline_overlap_px) / float(current_area_px)
+            )
+            semantic_change_type = (
+                "added"
+                if baseline_overlap_fraction <= added_overlap_cap
+                else "modified"
+            )
+            if semantic_change_type == "modified":
+                semantic_modified_mask |= current_mask
+            semantic_current_events.append(
+                {
+                    "change_type": semantic_change_type,
+                    "mask": current_mask,
+                    "area_px": current_area_px,
+                    "baseline_overlap_fraction": baseline_overlap_fraction,
+                    "polygon_parts": polygon_parts,
+                    "properties": current_props,
+                }
+            )
+
+    semantic_baseline_outputs_suppressed = 0
+
+    def _superseded_by_semantic_current(footprint_mask: Any) -> bool:
+        """Whether a dated replacement materially covers this baseline."""
+        if not semantic_modified_mask.any():
+            return False
+        fp = np.asarray(footprint_mask).astype(bool)
+        fp_area = int(fp.sum())
+        if fp_area < 1:
+            return False
+        overlap = int(np.logical_and(fp, semantic_modified_mask).sum())
+        return overlap > 0 and (
+            float(overlap) / float(fp_area)
+        ) >= added_overlap_cap
 
     # LiDAR-validated demolished rescue. Pulled up here so both the
     # per-source-feature path and the legacy component-labeled fallback can
@@ -954,13 +1164,17 @@ def stage_change(
     # to component-labeling the rasterized baseline mask.
     source_features = _load_baseline_source_features(work_dir)
 
-    local_reg_max_shift = _local_registration_max_shift_px()
+    local_reg_max_shift = (
+        0
+        if current_footprints_mask is not None
+        else _local_registration_max_shift_px()
+    )
     local_reg_min_gain = _local_registration_min_iou_gain()
     local_reg_applied = 0
 
     if source_features is not None and not pixel_space_only:
         summary.qa["change_source"] = "per_source_feature"
-        h, w = im.shape
+        h, w = classification_im.shape
         for src_feat in source_features:
             geom = src_feat.get("geometry")
             if not geom:
@@ -980,6 +1194,9 @@ def stage_change(
             )
             if not scoring_mask.any():
                 scoring_mask = single_mask
+            if _superseded_by_semantic_current(scoring_mask):
+                semantic_baseline_outputs_suppressed += 1
+                continue
 
             # IoU measured within the footprint's bbox (pad 10%) so a
             # single large SAM2 blob can't swallow every neighbor. On top of
@@ -997,7 +1214,7 @@ def stage_change(
             x1 = min(w, x1 + pad_x)
             fp_roi = scoring_mask[y0:y1, x0:x1]
             iou, local_shift = _best_local_iou(
-                im,
+                classification_im,
                 fp_roi,
                 y0=y0,
                 y1=y1,
@@ -1094,6 +1311,9 @@ def stage_change(
             comp_area_px = int(comp.sum())
             if comp_area_px < 1:
                 continue
+            if _superseded_by_semantic_current(comp):
+                semantic_baseline_outputs_suppressed += 1
+                continue
 
             ys, xs = np.where(comp)
             y0, y1 = int(ys.min()), int(ys.max()) + 1
@@ -1107,7 +1327,7 @@ def stage_change(
 
             comp_roi = comp[y0:y1, x0:x1]
             iou, local_shift = _best_local_iou(
-                im,
+                classification_im,
                 comp_roi,
                 y0=y0,
                 y1=y1,
@@ -1176,8 +1396,57 @@ def stage_change(
                 )
 
     # ------------------------------------------------------------------
-    # 2. Find "added" buildings — components in imagery that don't overlap
-    #    any baseline footprint.
+    # 2. Emit dated semantic current-footprint events.
+    # ------------------------------------------------------------------
+    semantic_current_counts = {"added": 0, "modified": 0}
+    for semantic_event in semantic_current_events:
+        semantic_change_type = str(semantic_event["change_type"])
+        semantic_current_counts[semantic_change_type] += 1
+        counts[semantic_change_type] += 1
+        semantic_area_m2 = (
+            float(semantic_event["area_px"]) * px_area_m2
+            if px_area_m2 > 0
+            else None
+        )
+        semantic_props = _extract_current_source_provenance(
+            semantic_event.get("properties")
+        )
+        semantic_props.update(
+            {
+                "baseline_overlap_fraction": round(
+                    float(semantic_event["baseline_overlap_fraction"]), 4
+                ),
+                "semantic_change_basis": "construction_year",
+            }
+        )
+        semantic_confidence = (
+            _current_source_added_confidence()
+            if semantic_change_type == "added"
+            else _current_source_modified_confidence()
+        )
+        for coordinates in semantic_event["polygon_parts"]:
+            features.append(
+                _feature(
+                    change_type=semantic_change_type,
+                    coordinates=coordinates,
+                    area_m2=semantic_area_m2,
+                    baseline_iou=None,
+                    imagery_year=request.imagery_year,
+                    baseline_year=request.baseline_year,
+                    crs_value=crs_value,
+                    extra_props=semantic_props,
+                    confidence=semantic_confidence,
+                )
+            )
+    summary.qa["semantic_current_change_counts"] = semantic_current_counts
+    summary.qa["semantic_baseline_outputs_suppressed"] = int(
+        semantic_baseline_outputs_suppressed
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Generic added fallback — automatic/prompted components that don't
+    #    overlap a baseline. A usable semantic current collection is complete
+    #    for the AOI and disables this noisier lane, preventing duplicates.
     # ------------------------------------------------------------------
     added_max_baseline_h = _added_max_baseline_epoch_height_m()
     added_height_pctl = _added_height_percentile()
@@ -1203,7 +1472,7 @@ def stage_change(
     # footprint mask — the production configuration). Soft-skips when the
     # ortho path is absent or the shape mismatches (unit-test fixtures).
     ortho_rgb = None
-    if added_exg_threshold > 0:
+    if generic_added_fallback_used and added_exg_threshold > 0:
         _ortho_path = ctx.get("orthophoto_path")
         if _ortho_path is not None:
             _rgb = _load_rgb(Path(_ortho_path))
@@ -1216,11 +1485,15 @@ def stage_change(
     # times.
     baseline_dilated_wide = (
         _n_step_dilate(base, added_baseline_dilate_px)
-        if added_baseline_dilate_px > 0
+        if generic_added_fallback_used and added_baseline_dilate_px > 0
         else None
     )
 
-    added_pixels = np.logical_and(added_im, np.logical_not(base))
+    added_pixels = (
+        np.logical_and(added_im, np.logical_not(base))
+        if generic_added_fallback_used
+        else np.zeros_like(base, dtype=bool)
+    )
     added_labels, added_n = _label_components(added_pixels)
     for comp_id in range(1, added_n + 1):
         comp = added_labels == comp_id
@@ -1545,20 +1818,24 @@ def stage_change(
     # without parsing the geojson.
     summary.qa["change_counts"] = dict(counts)
     summary.qa["local_registration_applied"] = int(local_reg_applied)
-    # Why the "added" gate rejected candidates — diagnostic signal for
-    # tuning. Empty buckets are fine. total = rejected; accepted is
-    # change_counts["added"].
+    # Why the generic AMG/prompted added gate rejected candidates. Semantic
+    # current-footprint additions bypass this noisy candidate lane and are
+    # counted separately in semantic_current_change_counts.
     summary.qa["added_rejected"] = dict(added_reject_reasons)
 
     classification_change_mask = np.logical_or(
-        np.logical_and(im, np.logical_not(base)),
-        np.logical_and(base, np.logical_not(im)),
+        np.logical_and(classification_im, np.logical_not(base)),
+        np.logical_and(base, np.logical_not(classification_im)),
     )
     # Include current-only discovery pixels in the coarse downstream change
     # mask, while keeping them out of the baseline IoU classifier above.
     change_mask = np.logical_or(
         classification_change_mask,
-        np.logical_and(added_im, np.logical_not(base)),
+        (
+            np.logical_and(added_im, np.logical_not(base))
+            if generic_added_fallback_used
+            else np.zeros_like(base, dtype=bool)
+        ),
     ).astype(np.uint8)
     return {**ctx, "change_path": out_path, "change_mask": change_mask}
 

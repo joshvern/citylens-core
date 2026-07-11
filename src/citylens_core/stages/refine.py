@@ -131,6 +131,33 @@ def stage_refine(
         ).astype(np.uint8)
         refined_baseline_mask = baseline_footprints_mask
 
+    # Optional semantic current-building source. The staging contract already
+    # reprojects these geometries into the orthophoto CRS, so rasterize them
+    # directly on the same grid without morphology or image-derived shifts.
+    # An empty valid collection intentionally becomes an all-zero mask.
+    current_footprints_path = Path(work_dir) / "current_footprints.geojson"
+    current_footprints_mask = None
+    if (
+        shape is not None
+        and transform is not None
+        and current_footprints_path.exists()
+    ):
+        try:
+            current_footprints_mask = load_geojson_mask(
+                current_footprints_path,
+                out_shape=shape,
+                transform=transform,
+                pixel_space=False,
+            ).astype(np.uint8)
+            summary.qa["current_footprints_mask"] = binary_mask_stats(
+                current_footprints_mask
+            )
+        except Exception as exc:
+            summary.warn(
+                "current_footprints_rasterize_failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
     out = {
         **ctx,
         "refined_mask": refined_mask,
@@ -140,6 +167,9 @@ def stage_refine(
     if baseline_footprints_mask is not None:
         out["baseline_footprints_mask"] = baseline_footprints_mask
         out["baseline_footprints_path"] = baseline_footprints_path
+    if current_footprints_mask is not None:
+        out["current_footprints_mask"] = current_footprints_mask
+        out["current_footprints_path"] = current_footprints_path
     if crs is not None:
         out["orthophoto_crs"] = crs
     if transform is not None:

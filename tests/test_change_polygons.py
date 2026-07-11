@@ -11,6 +11,51 @@ from affine import Affine
 from PIL import Image
 
 
+def _current_feature(
+    *,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    construction_year: int,
+    base_bbl: str = "4000000000",
+) -> dict:
+    return {
+        "type": "Feature",
+        "properties": {
+            "construction_year": construction_year,
+            "last_status_type": "Constructed",
+            "geom_source": "nyc_building_footprints",
+            "base_bbl": base_bbl,
+            "mappluto_bbl": base_bbl,
+            "source_dataset": "building_footprints+mappluto",
+        },
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [
+                [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
+            ],
+        },
+    }
+
+
+def _write_current_footprints(tmp_path: Path, features: list[dict]) -> Path:
+    path = tmp_path / "current_footprints.geojson"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "crs": {
+                    "type": "name",
+                    "properties": {"name": "EPSG:3857"},
+                },
+                "features": features,
+            }
+        )
+    )
+    return path
+
+
 def _run_stage(tmp_path: Path, *, mask, baseline_mask, transform=None, crs=None, ctx_extra=None):
     from citylens_core.models import CitylensRequest, PipelineSummary
     from citylens_core.stages.change import stage_change
@@ -34,6 +79,200 @@ def _run_stage(tmp_path: Path, *, mask, baseline_mask, transform=None, crs=None,
     out = stage_change(req, tmp_path, ctx, summary)
     payload = json.loads((tmp_path / "change.geojson").read_text())
     return payload, summary, out
+
+
+def test_post_baseline_current_footprint_emits_semantic_added(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A dated footprint in baseline-empty space bypasses noisy AMG gates."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=2, y0=2, x1=10, y1=10, construction_year=1900
+            ),
+            _current_feature(
+                x0=25,
+                y0=25,
+                x1=34,
+                y1=34,
+                construction_year=2022,
+                base_bbl="4016020028",
+            ),
+        ],
+    )
+    base = np.zeros((40, 40), dtype=np.uint8)
+    base[2:10, 2:10] = 1
+    sam = base.copy()
+    # Even if AMG independently sees the new roof, the semantic collection
+    # disables generic emission so the building appears exactly once.
+    discovery = np.zeros_like(base)
+    discovery[25:34, 25:34] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=sam,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+        ctx_extra={"refined_added_discovery_mask": discovery},
+    )
+
+    added = [
+        feature
+        for feature in payload["features"]
+        if feature["properties"]["change_type"] == "added"
+    ]
+    assert len(added) == 1
+    props = added[0]["properties"]
+    assert props["construction_year"] == 2022
+    assert props["base_bbl"] == "4016020028"
+    assert props["mappluto_bbl"] == "4016020028"
+    assert props["last_status_type"] == "Constructed"
+    assert props["geom_source"] == "nyc_building_footprints"
+    assert props["source_dataset"] == "building_footprints+mappluto"
+    assert props["current_footprint_semantic"] is True
+    assert props["semantic_change_basis"] == "construction_year"
+    assert props["baseline_overlap_fraction"] == 0.0
+    assert 0.8 <= props["confidence"] < 1.0
+    assert summary.qa["current_footprints_used"] is True
+    assert summary.qa["generic_added_fallback_used"] is False
+    assert summary.qa["semantic_current_change_counts"] == {
+        "added": 1,
+        "modified": 0,
+    }
+
+
+def test_post_baseline_expansion_emits_modified_and_supersedes_old_footprint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Construction-year evidence overrides shape-only 'unchanged'."""
+    monkeypatch.setenv("CITYLENS_CHANGE_MIN_AREA_M2", "1")
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=8,
+                y0=8,
+                x1=24,
+                y1=24,
+                construction_year=2021,
+                base_bbl="3000000001",
+            )
+        ],
+    )
+    base = np.zeros((32, 32), dtype=np.uint8)
+    base[10:22, 10:22] = 1
+    # SAM/current geometry fully covers the old footprint, which would be
+    # shape-only unchanged without the dated semantic source.
+    sam = np.zeros_like(base)
+    sam[8:24, 8:24] = 1
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=sam,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert [f["properties"]["change_type"] for f in payload["features"]] == [
+        "modified"
+    ]
+    props = payload["features"][0]["properties"]
+    assert props["construction_year"] == 2021
+    assert props["baseline_overlap_fraction"] > 0.5
+    assert 0.8 <= props["confidence"] < 1.0
+    assert summary.qa["semantic_baseline_outputs_suppressed"] == 1
+    assert summary.qa["change_counts"] == {
+        "unchanged": 0,
+        "modified": 1,
+        "demolished": 0,
+        "added": 0,
+    }
+
+
+def test_pre_baseline_current_footprint_is_not_falsely_added(
+    tmp_path: Path,
+) -> None:
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=10, y0=10, x1=20, y1=20, construction_year=2005
+            )
+        ],
+    )
+    empty = np.zeros((30, 30), dtype=np.uint8)
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=empty,
+        baseline_mask=empty,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    assert payload["features"] == []
+    assert summary.qa["change_counts"]["added"] == 0
+    assert summary.qa["semantic_current_change_counts"]["added"] == 0
+    assert summary.qa["generic_added_fallback_used"] is False
+
+
+def test_valid_empty_current_collection_is_authoritative(tmp_path: Path) -> None:
+    _write_current_footprints(tmp_path, [])
+    base = np.zeros((24, 24), dtype=np.uint8)
+    base[6:18, 6:18] = 1
+    # SAM still sees a roof, but the successful semantic source attests there
+    # are no current buildings in the AOI. Empty is not an API-failure fallback.
+    sam = base.copy()
+
+    payload, summary, _ = _run_stage(
+        tmp_path,
+        mask=sam,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    kinds = [feature["properties"]["change_type"] for feature in payload["features"]]
+    assert kinds == ["demolished"]
+    assert summary.qa["current_footprints_used"] is True
+    assert summary.qa["current_footprint_feature_count"] == 0
+    assert summary.qa["generic_added_fallback_used"] is False
+
+
+def test_current_footprint_presence_prevents_sam_miss_false_demolition(
+    tmp_path: Path,
+) -> None:
+    _write_current_footprints(
+        tmp_path,
+        [
+            _current_feature(
+                x0=6, y0=6, x1=18, y1=18, construction_year=1910
+            )
+        ],
+    )
+    base = np.zeros((24, 24), dtype=np.uint8)
+    base[6:18, 6:18] = 1
+    sam_miss = np.zeros_like(base)
+
+    payload, summary, out = _run_stage(
+        tmp_path,
+        mask=sam_miss,
+        baseline_mask=base,
+        transform=Affine.identity(),
+        crs="EPSG:3857",
+    )
+
+    kinds = [feature["properties"]["change_type"] for feature in payload["features"]]
+    assert kinds == ["unchanged"]
+    assert summary.qa["change_counts"]["demolished"] == 0
+    assert summary.qa["current_presence_source"] == "current_footprints"
+    assert summary.qa["registration"]["mode"] == "semantic_exact"
+    # SAM stays untouched for pipeline-level mask QA and fallback rendering.
+    assert not out["mask"].any()
 
 
 def test_unchanged_building_gets_unchanged_feature(tmp_path: Path, monkeypatch) -> None:

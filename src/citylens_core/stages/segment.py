@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -55,6 +56,30 @@ def _added_discovery_enabled() -> bool:
     switch exists for constrained environments and controlled ablations.
     """
     return _bool_env("CITYLENS_SAM2_ADDED_DISCOVERY", True)
+
+
+def _has_semantic_current_footprints(
+    *, work_dir: Path, ortho_transform: Any | None
+) -> bool:
+    """Whether a staged current-footprint collection can replace AMG.
+
+    The stager guarantees geometries are already in the orthophoto CRS, so a
+    raster transform is the only additional requirement.  Invalid files do
+    not suppress automatic discovery; change detection retains its existing
+    local fallback instead.
+    """
+    path = work_dir / "current_footprints.geojson"
+    if ortho_transform is None or not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("type") == "FeatureCollection"
+        and isinstance(payload.get("features"), list)
+    )
 
 
 def _load_baseline_footprints_mask(
@@ -113,6 +138,16 @@ def stage_segment(
     use_prompted = (mode == "prompted") or (
         mode == "auto_fallback" and baseline_has_features
     )
+    semantic_current_available = want_change and _has_semantic_current_footprints(
+        work_dir=work_dir,
+        ortho_transform=ctx.get("orthophoto_transform"),
+    )
+    summary.qa["current_footprints_staged"] = bool(
+        (work_dir / "current_footprints.geojson").exists()
+    )
+    summary.qa["current_footprints_semantic_available"] = bool(
+        semantic_current_available
+    )
 
     if mode == "prompted" and not baseline_has_features:
         raise RuntimeError(
@@ -129,12 +164,24 @@ def stage_segment(
         if use_prompted:
             assert baseline_footprints_mask is not None
             # Prompted SAM2 is intentionally constrained to baseline
-            # footprints.  Keep that high-precision mask for baseline IoU
-            # classification, while a separate current-image AMG pass finds
-            # structures that did not exist at the baseline epoch.  Never
-            # union the two here: doing so would let AMG noise change
-            # unchanged/modified/demolished calls.
-            if want_change and _added_discovery_enabled():
+            # footprints. Keep that high-precision mask for imagery QA and,
+            # when no semantic current layer exists, baseline IoU. A separate
+            # current-image AMG pass then finds structures that did not exist
+            # at baseline. Never union the two here: doing so would let AMG
+            # noise change unchanged/modified/demolished calls.
+            if semantic_current_available:
+                # The staged vector collection is a complete, semantic
+                # current-building source.  Keep prompted SAM for its normal
+                # imagery QA, but avoid an unnecessary/noisier AMG pass.
+                mask = run_sam2_baseline_prompted(
+                    image_rgb,
+                    baseline_footprints_mask,
+                    cfg_path=Path(request.sam2_cfg or ""),
+                    ckpt_path=Path(request.sam2_checkpoint or ""),
+                )
+                summary.qa["sam2_added_discovery_mode"] = "current_footprints"
+                summary.qa["sam2_added_discovery_status"] = "not_needed"
+            elif want_change and _added_discovery_enabled():
                 summary.qa["sam2_added_discovery_mode"] = "automatic"
                 summary.qa["sam2_added_discovery_status"] = "running"
                 try:
@@ -173,11 +220,16 @@ def stage_segment(
                 ckpt_path=Path(request.sam2_checkpoint or ""),
             )
             if want_change:
-                # The primary mask is already automatic, so it is also the
-                # discovery mask.  Reuse it rather than running AMG twice.
-                added_discovery_mask = mask
-                summary.qa["sam2_added_discovery_mode"] = "primary_auto"
-                summary.qa["sam2_added_discovery_status"] = "reused"
+                if semantic_current_available:
+                    summary.qa["sam2_added_discovery_mode"] = "current_footprints"
+                    summary.qa["sam2_added_discovery_status"] = "not_needed"
+                else:
+                    # The primary mask is already automatic, so it is also
+                    # the discovery mask. Reuse it rather than running AMG
+                    # twice.
+                    added_discovery_mask = mask
+                    summary.qa["sam2_added_discovery_mode"] = "primary_auto"
+                    summary.qa["sam2_added_discovery_status"] = "reused"
             else:
                 summary.qa["sam2_added_discovery_mode"] = "not_requested"
                 summary.qa["sam2_added_discovery_status"] = "not_requested"

@@ -109,13 +109,19 @@ print(artifacts)
 - `mesh.ply` uses `work_dir/lidar.las` when available and `laspy` is installed; otherwise it
   falls back to a deterministic mask-height mesh.
 - `run_summary.json` includes `qa` and `performance` sections with optional parity metrics.
-- When baseline footprints select prompted SAM2 and `change` is requested,
-  CityLens also runs automatic SAM2 on the current orthophoto for
-  added-building discovery. The masks stay separate: prompted output drives
-  existing-footprint IoU classifications, while automatic output is consumed
-  only by the `added` path. `CITYLENS_SAM2_ADDED_DISCOVERY=false` restores the
-  legacy prompted-only behavior for explicit ablations; discovery is otherwise
-  required and a discovery failure fails the change run. Edge-connected
-  automatic components are rejected by default to suppress tile-scale
-  road/background masks (`CITYLENS_CHANGE_ADDED_REJECT_BORDER_TOUCHING=false`
-  disables that gate).
+- `work_dir/current_footprints.geojson` is an optional, purely local semantic
+  current-building source. Its FeatureCollection geometries must already be in
+  the orthophoto CRS; `construction_year`, `last_status_type`, `geom_source`,
+  `base_bbl`, `mappluto_bbl`, and `source_dataset` properties are forwarded as
+  provenance. When usable, its rasterized union is preferred for current
+  building presence and dated post-baseline features directly produce
+  `added`/`modified` events. A valid empty collection is authoritative.
+- Without semantic current footprints, prompted `change` runs also run
+  automatic SAM2 on the current orthophoto for added-building discovery. The
+  masks stay separate: prompted output drives existing-footprint IoU while the
+  automatic output is consumed only by the `added` path.
+  `CITYLENS_SAM2_ADDED_DISCOVERY=false` restores prompted-only behavior for
+  explicit ablations; discovery otherwise fails honestly with the run.
+  Edge-connected automatic components are rejected by default to suppress
+  tile-scale road/background masks
+  (`CITYLENS_CHANGE_ADDED_REJECT_BORDER_TOUCHING=false` disables that gate).

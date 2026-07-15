@@ -130,3 +130,25 @@ print(artifacts)
   Edge-connected automatic components are rejected by default to suppress
   tile-scale road/background masks
   (`CITYLENS_CHANGE_ADDED_REJECT_BORDER_TOUCHING=false` disables that gate).
+- **LiDAR epoch semantics (v0.3.25):** production LiDAR is baseline-epoch
+  (2017), so a *flat* LiDAR reading where SAM2 sees a current building is
+  positive evidence of new construction — such `added` events get boosted
+  confidence (`baseline_lidar_flat: true`), while a tall-in-baseline reading
+  demotes to `candidate_added`. `CITYLENS_CHANGE_ADDED_MAX_BASELINE_HEIGHT_M`
+  (default 2.0; legacy `CITYLENS_CHANGE_ADDED_MIN_HEIGHT_M` honored as
+  fallback) sets the flat threshold. The demolished-rescue check is epoch-gated
+  **off** by default (`CITYLENS_CHANGE_DEMOLISHED_RESCUE_LIDAR_EPOCH=baseline`;
+  set `current` only if your LAS is current-epoch). `height_m` on features is
+  baseline-epoch height.
+- Other change-stage tuning: `CITYLENS_CHANGE_ADDED_EXG_THRESHOLD` (median
+  ExG vegetation reject on the added path, default 30),
+  `CITYLENS_CHANGE_MIN_AREA_M2` (default 60; areas are true ground m² — the
+  Web-Mercator cos²(lat) correction is applied), per-footprint local
+  registration (±2 px windowed slide; `local_shift_px` property,
+  `registration.saturated` QA flag), `CITYLENS_SAM2_PROMPT_BATCH_SIZE`
+  (default 32).
+- `run_summary.json` QA reports `mask_xor_f1` (agreement between the change
+  classification and the raw mask XOR — a consistency signal, **not** an
+  accuracy metric; its reference is circular). The old `change_polygon_f1`
+  name is kept as a deprecated alias. For an external accuracy check, use the
+  DOB weak-label harness in `citylens-parcel-intel/scripts/weak_label_eval.py`.

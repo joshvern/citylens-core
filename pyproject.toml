@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,22 +8,31 @@ version = "0.3.25"
 description = "Citylens reusable pipeline core (local-workdir artifacts, pluggable segmentation backends)."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Citylens" }]
 dependencies = [
   "pydantic>=2.0",
   "numpy>=1.23",
-  "pillow>=10.0",
+  "pillow>=12.3.0",
   "rasterio>=1.3",
   "shapely>=2.0",
   "pyproj>=3.0",
   "requests>=2.31",
+  "idna>=3.15",
+  "urllib3>=2.7.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "ruff>=0.3"]
 lidar = ["laspy>=2.5"]
-sam2 = ["sam-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4"]
+sam2 = [
+  "sam-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4",
+  "click>=8.3.3",
+  "setuptools>=83.0.0",
+  "torch>=2.13.0",
+  "torchvision>=0.28.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

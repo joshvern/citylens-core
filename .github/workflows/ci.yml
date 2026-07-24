@@ -3,36 +3,82 @@ name: ci
 on:
   push:
     branches:
-      # Default branch is `master`; `main` is listed too so this still works
-      # if the repo is renamed later. PRs already trigger via `pull_request:`.
       - master
       - main
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11"]
-
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
 
-      - name: Install package
-        run: python -m pip install --upgrade pip
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
-      - name: Install test deps
-        run: python -m pip install -e ".[dev]"
+      - name: Verify lockfile
+        run: uv lock --check
+
+      - name: Sync test and LiDAR environment
+        run: uv sync --extra dev --extra lidar --frozen
 
       - name: Lint
-        run: python -m ruff check src tests
+        run: ./.venv/bin/python -m ruff check src tests
 
       - name: Test
-        run: python -m pytest
+        run: ./.venv/bin/python -m pytest
+
+      - name: Audit all locked dependencies
+        run: |
+          uv export \
+            --extra dev \
+            --extra lidar \
+            --extra sam2 \
+            --no-emit-project \
+            --no-emit-package sam-2 \
+            --frozen \
+            --format requirements.txt \
+            --output-file core-runtime-audit.txt \
+            >/dev/null
+          uvx --from pip-audit==2.10.1 pip-audit \
+            --strict \
+            --progress-spinner off \
+            --disable-pip \
+            --requirement core-runtime-audit.txt
+
+      - name: Generate dependency SBOM
+        run: |
+          uv export \
+            --preview-features sbom-export \
+            --extra lidar \
+            --extra sam2 \
+            --no-dev \
+            --frozen \
+            --format cyclonedx1.5 \
+            --output-file core-runtime.cdx.json \
+            >/dev/null
+
+      - name: Build and verify distributions
+        run: |
+          uv build --no-sources
+          uvx --from twine==6.2.0 twine check dist/*
+
+      - name: Upload release evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: core-release-evidence
+          path: |
+            core-runtime.cdx.json
+            dist/
+          if-no-files-found: warn
+          retention-days: 30

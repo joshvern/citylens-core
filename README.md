@@ -33,11 +33,11 @@ algorithms and legacy workflow comparison.
 
 ## Install
 
-Quickstart (no `requirements.txt`; everything is driven by `pyproject.toml`):
+Contributor quickstart (the committed lockfile is authoritative):
 
 ```bash
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,sam2]"
+uv sync --extra dev --extra lidar --frozen
+./.venv/bin/python -m pytest
 ```
 
 When working from the shared `/home/josh/citylens` parent folder, keep this
@@ -45,32 +45,36 @@ repo's environment isolated:
 
 ```bash
 cd /home/josh/citylens/citylens-core
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev,sam2]"
+uv sync --extra dev --extra lidar --frozen
 ```
 
 VS Code should open `citylens-core` directly, or use a workspace that contains
 `citylens-core`, `citylens-engine`, and `citylens-web` as separate folders. Do
 not rely on the parent folder to infer the interpreter or package root.
 
-Base (dev):
+Package consumers installing from a source checkout can select only the
+features they need:
 
 ```bash
-pip install -e ".[dev]"
+pip install .
 ```
 
 With SAM2:
 
 ```bash
-pip install -e ".[dev,sam2]"
+pip install ".[sam2]"
 ```
 
 With optional LiDAR helpers:
 
 ```bash
-pip install -e ".[dev,sam2,lidar]"
+pip install ".[lidar]"
 ```
+
+The generic `sam2` extra is accelerator-neutral and therefore allows the
+platform's normal PyTorch selection. The production worker deliberately uses
+the CPU-only PyTorch index and the frozen engine workspace lock instead. See
+[Supply chain and release evidence](docs/supply_chain.md).
 
 ## Download SAM2 assets
 
